@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,69 @@ void test_string_codec() {
     require(!lexLess(codec.encode("abc"), codec.encode("abc")), "string order abc !< abc (equal)");
 }
 
+// -0.0 and +0.0 compare equal under IEEE-754 but have different raw bit patterns - without
+// DoubleCodec's explicit normalization they'd encode to different keys, silently breaking
+// matches between a predicate inserted at one and a query at the other.
+void test_double_negative_zero() {
+    require(pstree::DoubleCodec::encode(-0.0) == pstree::DoubleCodec::encode(0.0),
+            "-0.0 and +0.0 must encode identically");
+}
+
+// NaN has no total order - encoding it would silently place it somewhere arbitrary and
+// wrong rather than fail, so it's rejected outright.
+void test_double_nan_rejected() {
+    bool threw = false;
+    try {
+        pstree::DoubleCodec::encode(std::numeric_limits<double>::quiet_NaN());
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "encoding NaN should throw std::invalid_argument");
+}
+
+// nextElementKey/prevElementKey: ordinary mixed-radix increment/decrement, generic across
+// every codec's own KeyShape - exercised directly here (rather than only indirectly via
+// PS-Tree's kGt/kLt) so a bug in the stepping logic itself isn't masked by tree behavior.
+void test_adjacent_key_stepping() {
+    // No carry needed: last digit has room to increment/decrement.
+    {
+        auto k = pstree::Int64Codec::encode(5);
+        auto next = pstree::nextElementKey(pstree::Int64Codec::shape(), k);
+        require(next.has_value(), "next(5) should exist");
+        require(pstree::Int64Codec::decode(*next) == 6, "next(5) should decode to 6");
+
+        auto prev = pstree::prevElementKey(pstree::Int64Codec::shape(), k);
+        require(prev.has_value(), "prev(5) should exist");
+        require(pstree::Int64Codec::decode(*prev) == 4, "prev(5) should decode to 4");
+    }
+    // Carry propagation across a sign-changing boundary (-1 -> 0 -> 1).
+    {
+        auto k = pstree::Int64Codec::encode(-1);
+        auto next = pstree::nextElementKey(pstree::Int64Codec::shape(), k);
+        require(next.has_value() && pstree::Int64Codec::decode(*next) == 0, "next(-1) should decode to 0");
+        auto prev = pstree::prevElementKey(pstree::Int64Codec::shape(), k);
+        require(prev.has_value() && pstree::Int64Codec::decode(*prev) == -2, "prev(-1) should decode to -2");
+    }
+    // True overflow/underflow at the representable extremes.
+    {
+        auto kMax = pstree::Int64Codec::encode(std::numeric_limits<std::int64_t>::max());
+        require(!pstree::nextElementKey(pstree::Int64Codec::shape(), kMax).has_value(),
+                "next(INT64_MAX) should not exist");
+        auto kMin = pstree::Int64Codec::encode(std::numeric_limits<std::int64_t>::min());
+        require(!pstree::prevElementKey(pstree::Int64Codec::shape(), kMin).has_value(),
+                "prev(INT64_MIN) should not exist");
+    }
+    // Bool: radix 2, so next(false)=true exists, next(true) does not.
+    {
+        auto kFalse = pstree::BoolCodec::encode(false);
+        auto next = pstree::nextElementKey(pstree::BoolCodec::shape(), kFalse);
+        require(next.has_value() && pstree::BoolCodec::decode(*next) == true, "next(false) should be true");
+        auto kTrue = pstree::BoolCodec::encode(true);
+        require(!pstree::nextElementKey(pstree::BoolCodec::shape(), kTrue).has_value(),
+                "next(true) should not exist");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -94,6 +158,9 @@ int main() {
     test_double_round_trip_and_order();
     test_bool_codec();
     test_string_codec();
+    test_double_negative_zero();
+    test_double_nan_rejected();
+    test_adjacent_key_stepping();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";

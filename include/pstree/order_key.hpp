@@ -20,10 +20,11 @@
 // implement and reason about, and still isolates value-type/operator details from the
 // upper PSTDynamic layer exactly as Section 4.5 intends.
 
-#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -105,6 +106,19 @@ struct DoubleCodec {
     static KeyShape shape() { return KeyShape{std::vector<std::uint32_t>(kChunks, 1u << kBitsPerChunk)}; }
 
     static ElementKey encode(double v) {
+        // NaN has no well-defined position in a total order (IEEE-754 says NaN compares
+        // unequal, unordered, to everything including itself) - PS-Tree's whole model
+        // depends on a total order existing, so rather than silently encode NaN's bit
+        // pattern as if it were an ordinary sortable value (which would put it somewhere
+        // arbitrary and wrong), reject it clearly at the boundary.
+        if (std::isnan(v)) {
+            throw std::invalid_argument("pstree::DoubleCodec: NaN has no total order, cannot be encoded");
+        }
+        // -0.0 and +0.0 compare equal under IEEE-754 (v == 0.0 is true for both), but have
+        // DIFFERENT bit patterns (sign bit differs) - without this normalization they'd
+        // encode to different keys, so a predicate inserted against +0.0 would silently
+        // fail to match a query for -0.0 despite being numerically identical values.
+        if (v == 0.0) v = 0.0;
         std::uint64_t bits;
         static_assert(sizeof(bits) == sizeof(v));
         std::memcpy(&bits, &v, sizeof(bits));
@@ -167,5 +181,35 @@ private:
     static constexpr std::uint16_t kEndOfString = 0;
     std::size_t max_length_;
 };
+
+// Adjacent-key stepping: since every ElementKey is a fixed-length sequence of digits in a
+// declared per-level radix (a mixed-radix number), "the next/previous representable value"
+// is just ordinary mixed-radix increment/decrement with carry/borrow propagation from the
+// LEAST significant (last) element - this works identically for every codec above with no
+// type-specific logic, which is what lets PS-Tree support strict `>`/`<` by normalizing to
+// `>=next(V)`/`<=prev(V)` at the operator layer (see ps_tree.hpp's Op::kGt/kLt) instead of
+// needing its own separate tree-wiring for them. Returns nullopt on overflow/underflow -
+// i.e. `>` at the largest representable value, or `<` at the smallest, matches nothing.
+inline std::optional<ElementKey> nextElementKey(const KeyShape& shape, ElementKey key) {
+    for (std::size_t i = key.size(); i-- > 0;) {
+        if (key[i] + 1 < shape.radix[i]) {
+            key[i] += 1;
+            return key;
+        }
+        key[i] = 0; // carry
+    }
+    return std::nullopt; // every digit was already at its maximum - no successor
+}
+
+inline std::optional<ElementKey> prevElementKey(const KeyShape& shape, ElementKey key) {
+    for (std::size_t i = key.size(); i-- > 0;) {
+        if (key[i] > 0) {
+            key[i] -= 1;
+            return key;
+        }
+        key[i] = static_cast<std::uint16_t>(shape.radix[i] - 1); // borrow
+    }
+    return std::nullopt; // every digit was already 0 - no predecessor
+}
 
 } // namespace pstree

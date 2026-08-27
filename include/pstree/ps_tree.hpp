@@ -12,22 +12,22 @@
 // specific value types and operators from the upper matching layer") is a design goal, so
 // making the tree generic over the element codec follows the paper's own intent.
 //
-// SCOPE: only the four operators the paper actually gives pseudocode for are implemented
-// here - >= (kGe), = (kEq), <= (kLe), and in/BETWEEN (kIn, both endpoints inclusive).
-// InsertPredicate's own pseudocode (Algorithm 1, lines 2-10) only shows these three
-// ranges explicitly plus prose "other operators are processed in a similar way";
-// DeletePredicate (Algorithm 3, lines 1-17) independently confirms the same four
-// (>=, =, <=, in), never showing > or < explicitly either. Deriving a correct standalone
-// wiring for strict > / < turned out to need real care (an earlier draft of this file got
-// it wrong - see git history) and isn't actually necessary: since every value type here is
-// encoded as a discrete, totally-ordered ElementKey (order_key.hpp), ">V" and "<V" have a
-// well-defined equivalent as ">=next(V)" and "<=prev(V)" via adjacent-key stepping - that
-// normalization belongs in the PSTDynamic layer (Phase 2), one level above this file, not
-// duplicated as new tree-wiring logic here.
+// OPERATORS: the paper's own pseudocode only ever gives >= (kGe), = (kEq), <= (kLe), and
+// in/BETWEEN (kIn, both endpoints inclusive) - InsertPredicate (Algorithm 1, lines 2-10)
+// shows exactly these three ranges plus prose "other operators are processed in a similar
+// way"; DeletePredicate (Algorithm 3, lines 1-17) independently confirms the same four,
+// never showing > or < explicitly either. Deriving a correct standalone tree-wiring for
+// strict > / < turned out to need real care (an earlier draft of this file got it wrong -
+// see git history) and isn't actually necessary: since every value type here is encoded as
+// a discrete, totally-ordered ElementKey with a declared per-level radix (order_key.hpp),
+// ">V" and "<V" have an exact equivalent as ">=next(V)" and "<=prev(V)" via ordinary
+// mixed-radix increment/decrement (order_key.hpp's nextElementKey/prevElementKey) - kGt/kLt
+// below are handled by that normalization, reusing kGe/kLe's already-verified wiring rather
+// than adding new, separately-derived tree logic for them.
 //
-// Two identified discrepancies between the literally-printed pseudocode and what must be
-// correct, found by cross-checking against the paper's own worked examples and prose
-// before writing this code (not assumed - see the comments at each site):
+// Discrepancies between the literally-printed pseudocode and what must be correct, found
+// by cross-checking against the paper's own worked examples and prose, and by a randomized
+// property test (not assumed - see the comments at each site):
 //   1. MatchPair (Algorithm 2, line 8): the paper prints `GetLNode(currNode, pstree.root)`,
 //      but the surrounding prose says "GetRNode and GetLNode are invoked" (both used
 //      together) and Algorithm 1's own Partition uses the identical two-step pattern
@@ -39,6 +39,26 @@
 //      but `lNode` is never defined anywhere else in the function - `startNode`, whose
 //      predCounter was just decremented on the immediately preceding line, is clearly the
 //      intended variable. Implemented here as `startNode.predCounter == 0`.
+//   3. Neither PartitionLeafNodeLeft nor PartitionLeafNodeEqual's literal pseudocode
+//      updates any node OTHER than `currNode` itself when a leaf gets split - but
+//      GetLNode's own search (used by insertions arriving at OTHER, unrelated values) can
+//      permanently wire some other, already-existing node's `.l` link directly to a leaf
+//      that a LATER insertion then splits - leaving that other node's `.l` stale (pointing
+//      at a piece that's since been narrowed down to no longer include everything the
+//      other node needs). Caught two ways: first by hand-tracing Section 4.4's own worked
+//      example (a `.e` self-alias going stale after a `.l` redirect - see below), then by a
+//      randomized property test finding a second, more general instance (a WHOLLY
+//      UNRELATED node's `.l`, wired up by ITS OWN earlier insertion's search, going stale
+//      after a completely different later insertion's split). Both are the same underlying
+//      problem: `.l` links can be shared across nodes via search, and nothing in the
+//      literal pseudocode invalidates a stale one. Fixed generally, not case-by-case, via
+//      `l_refs` - each LeafNode tracks which InnerNodes currently point to it via `.l`
+//      (`setLeafL`/`redirectLeafLRefs` below) - so every split can correctly redirect EVERY
+//      such reference to the new "rightward" piece, not just the one node the immediate
+//      caller happens to already know about. A node's `.e` self-aliasing with its own `.l`
+//      (only possible for a node created via the kLe wiring, where they start equal) is
+//      handled as part of the same redirect, since it's discovered via the identical
+//      back-reference list.
 //
 // Deferred, not a correctness gap: the paper describes space MERGING (combining adjacent
 // leaves that end up with equal predicate counters after a deletion) only as prose with a
@@ -50,6 +70,7 @@
 // nothing covers it) and leaves both actual merging AND freeing zero-counter leaves as
 // follow-up work (freeing one safely needs the same inner-node rewiring merging would).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -60,19 +81,28 @@
 
 namespace pstree {
 
-// Only the operators PS-Tree's own algorithms give pseudocode for - see file-level
-// comment for why kGt/kLt are deliberately absent (handled one layer up via adjacent-key
-// normalization instead).
+// kGe/kEq/kLe/kIn are the paper's own pseudocode operators (see file-level comment).
+// kGt/kLt are supported by normalizing to kGe/kLe at an adjacent key, not via separate
+// tree-wiring - see insertPredicate/deletePredicate/matches-nothing handling below.
 enum class Op {
     kGe, // >=
+    kGt, // >
     kEq, // ==
+    kLt, // <
     kLe, // <=
     kIn, // BETWEEN [lo, hi], both endpoints inclusive
 };
 
+struct InnerNode;
+
 struct LeafNode {
     LeafNode* next = nullptr; // next leaf in increasing predicate-space order
     std::uint64_t predCounter = 0;
+    // Every InnerNode whose CURRENT `.leaf_l` points to this leaf - maintained by
+    // setLeafL()/redirectLeafLRefs() below, never touched directly. This is what lets a
+    // split correctly find and fix up every stale `.l` reference, not just the one node
+    // the immediate caller already knows about - see file-level comment #3.
+    std::vector<InnerNode*> l_refs;
     // Placeholder for Phase 2's own grouped subscription structure (dimension-signature
     // groups). Phase 1 has no subscription semantics yet - callers of insertPredicate get
     // back the affected LeafNode pointers directly and may attach whatever they like.
@@ -106,7 +136,7 @@ public:
         // is that g links to the first leaf node, and l links to the last leaf node."
         auto* first = new LeafNode();
         root_->leaf_g = first;
-        root_->leaf_l = first;
+        setLeafL(root_, first);
     }
 
     ~PSTree() { destroy(); }
@@ -115,7 +145,10 @@ public:
     PSTree& operator=(const PSTree&) = delete;
 
     // Algorithm 1, InsertPredicate. Returns every leaf whose predicate space is now
-    // covered by `pred` (predCounter already incremented on each).
+    // covered by `pred` (predCounter already incremented on each). kGt/kLt normalize to
+    // kGe/kLe at an adjacent key (see file-level comment); a kGt at the largest
+    // representable value (or kLt at the smallest) has no adjacent key to normalize to and
+    // correctly matches nothing, returning an empty vector without touching the tree.
     std::vector<LeafNode*> insertPredicate(const Predicate& pred) {
         LeafNode* startNode = nullptr;
         LeafNode* endNode = nullptr;
@@ -124,10 +157,24 @@ public:
                 startNode = partition(pred.vals0, Op::kGe);
                 endNode = root_->leaf_l;
                 break;
+            case Op::kGt: {
+                auto next = nextElementKey(shape_, pred.vals0);
+                if (!next) return {};
+                startNode = partition(*next, Op::kGe);
+                endNode = root_->leaf_l;
+                break;
+            }
             case Op::kEq:
                 startNode = partition(pred.vals0, Op::kEq);
                 endNode = startNode;
                 break;
+            case Op::kLt: {
+                auto prev = prevElementKey(shape_, pred.vals0);
+                if (!prev) return {};
+                startNode = root_->leaf_g;
+                endNode = partition(*prev, Op::kLe);
+                break;
+            }
             case Op::kLe:
                 startNode = root_->leaf_g;
                 endNode = partition(pred.vals0, Op::kLe);
@@ -175,7 +222,19 @@ public:
 
     // Algorithm 3, DeletePredicate. Decrements predCounter on every leaf `pred` covered.
     // Does NOT free zero-counter leaves or merge survivors (see file-level comment).
-    // Returns every leaf that was decremented, in order.
+    // Returns every leaf that was decremented, in order. kGt/kLt normalize exactly as
+    // insertPredicate does (see there) - a kGt/kLt that inserted nothing (overflow/
+    // underflow at the domain edge) correctly deletes nothing either, since the same
+    // deterministic normalization recomputes the same "no adjacent key" result.
+    //
+    // Precondition (checked, not silently accepted): every leaf `pred` covers must have a
+    // predCounter of at least 1 before this call - i.e. `pred` (or something covering the
+    // exact same range) must actually have been inserted and not already fully deleted.
+    // predCounter is unsigned, so decrementing past zero would silently wrap to a huge
+    // value instead of failing loudly - guarded against explicitly since that would corrupt
+    // every future insert/delete/match touching this leaf in a way that's very hard to
+    // trace back to its actual cause (a caller bug: double-delete, or deleting something
+    // that was never inserted).
     std::vector<LeafNode*> deletePredicate(const Predicate& pred) {
         LeafNode* startNode = nullptr;
         LeafNode* endNode = nullptr;
@@ -184,10 +243,24 @@ public:
                 startNode = matchPair(pred.vals0);
                 endNode = root_->leaf_l;
                 break;
+            case Op::kGt: {
+                auto next = nextElementKey(shape_, pred.vals0);
+                if (!next) return {};
+                startNode = matchPair(*next);
+                endNode = root_->leaf_l;
+                break;
+            }
             case Op::kEq:
                 startNode = matchPair(pred.vals0);
                 endNode = startNode;
                 break;
+            case Op::kLt: {
+                auto prev = prevElementKey(shape_, pred.vals0);
+                if (!prev) return {};
+                startNode = root_->leaf_g;
+                endNode = matchPair(*prev);
+                break;
+            }
             case Op::kLe:
                 startNode = root_->leaf_g;
                 endNode = matchPair(pred.vals0);
@@ -201,6 +274,11 @@ public:
         LeafNode* cur = startNode;
         LeafNode* stop = endNode->next;
         while (cur != stop) {
+            if (cur->predCounter == 0) {
+                throw std::logic_error(
+                    "pstree: DeletePredicate would underflow a leaf's predCounter - "
+                    "deleting a predicate that was never inserted, or double-deleting one");
+            }
             // See file-level comment #2: startNode (not the undefined `lNode`).
             cur->predCounter -= 1;
             leafNodes.push_back(cur);
@@ -242,6 +320,43 @@ private:
             node->p.assign(levelRadix(level), nullptr);
         }
         return node;
+    }
+
+    // Assigns node->leaf_l, keeping l_refs (see LeafNode) consistent: removes `node` from
+    // its old target's back-reference list (if any) and adds it to the new one. Every
+    // `.leaf_l` assignment in this file goes through this - never assign the field
+    // directly - so l_refs is always an accurate answer to "who currently points at me".
+    static void setLeafL(InnerNode* node, LeafNode* newLeaf) {
+        if (node->leaf_l != nullptr) {
+            auto& refs = node->leaf_l->l_refs;
+            refs.erase(std::remove(refs.begin(), refs.end(), node), refs.end());
+        }
+        node->leaf_l = newLeaf;
+        if (newLeaf != nullptr) newLeaf->l_refs.push_back(node);
+    }
+
+    // Redirects every InnerNode currently pointing at `oldLeaf` via `.leaf_l` (except
+    // `exclude`, always the node performing the current split - its own `.leaf_l` is being
+    // managed directly by its caller in the same operation, not through this generic path)
+    // to `newLeaf` instead. Also propagates to `.leaf_e` wherever it was self-aliased with
+    // the old `.leaf_l` value (only possible for a node created via kLe wiring, where they
+    // start equal - see file-level comment #3). Safe to call unconditionally even when
+    // `oldLeaf` has no other referrers: the loop body just never runs.
+    //
+    // Why every entry in oldLeaf->l_refs is guaranteed to need this redirect (not just some
+    // of them): oldLeaf currently represents a single undivided range up to the new split
+    // point V. Any node with `.leaf_l == oldLeaf` must have a value >= V - if it were
+    // strictly between oldLeaf's own start and V, oldLeaf would already have been split at
+    // that point by that node's own earlier insertion, contradicting "oldLeaf is currently
+    // undivided up to V". So every referrer's `.leaf_l` should now point past V, at
+    // whichever new piece extends rightward from the split - exactly `newLeaf`.
+    static void redirectLeafLRefs(LeafNode* oldLeaf, LeafNode* newLeaf, InnerNode* exclude) {
+        std::vector<InnerNode*> refs = oldLeaf->l_refs; // copy - setLeafL mutates the original mid-loop
+        for (InnerNode* node : refs) {
+            if (node == exclude) continue;
+            if (node->leaf_e == oldLeaf) node->leaf_e = newLeaf;
+            setLeafL(node, newLeaf);
+        }
     }
 
     // Algorithm 1, GetRNode: walk back up `path` (built while descending) looking for the
@@ -312,29 +427,40 @@ private:
     // Transcribed directly: kGe further splits currNode.l/e apart if they're still the
     // same leaf; kLe further splits currNode.e/g apart if they're still the same leaf;
     // kEq does whichever of the two is still needed (both can be pending at once the
-    // first time a `=` predicate meets a boundary another operator already created).
+    // first time a `=` predicate meets a boundary another operator already created). Every
+    // branch additionally calls redirectLeafLRefs on the leaf being narrowed - see file-
+    // level comment #3 for why any node other than currNode referencing that leaf via
+    // `.leaf_l` needs updating too, not just currNode's own fields.
     void partitionLeafNodeEqual(InnerNode* currNode, Op op) {
         if (op == Op::kGe) {
             if (currNode->leaf_l == currNode->leaf_e) {
-                LeafNode* leafNode = copyLeafNode(currNode->leaf_l);
-                currNode->leaf_l->next = leafNode;
+                LeafNode* oldLeaf = currNode->leaf_l;
+                LeafNode* leafNode = copyLeafNode(oldLeaf);
+                oldLeaf->next = leafNode;
                 currNode->leaf_e = leafNode;
+                redirectLeafLRefs(oldLeaf, leafNode, currNode);
             }
         } else if (op == Op::kLe) {
             if (currNode->leaf_e == currNode->leaf_g) {
-                LeafNode* leafNode = copyLeafNode(currNode->leaf_e);
-                currNode->leaf_e->next = leafNode;
+                LeafNode* oldLeaf = currNode->leaf_e;
+                LeafNode* leafNode = copyLeafNode(oldLeaf);
+                oldLeaf->next = leafNode;
                 currNode->leaf_g = leafNode;
+                redirectLeafLRefs(oldLeaf, leafNode, currNode);
             }
         } else if (op == Op::kEq) {
             if (currNode->leaf_e == currNode->leaf_g) {
-                LeafNode* leafNode = copyLeafNode(currNode->leaf_e);
-                currNode->leaf_e->next = leafNode;
+                LeafNode* oldLeaf = currNode->leaf_e;
+                LeafNode* leafNode = copyLeafNode(oldLeaf);
+                oldLeaf->next = leafNode;
                 currNode->leaf_g = leafNode;
+                redirectLeafLRefs(oldLeaf, leafNode, currNode);
             } else if (currNode->leaf_l == currNode->leaf_e) {
-                LeafNode* leafNode = copyLeafNode(currNode->leaf_l);
-                currNode->leaf_l->next = leafNode;
+                LeafNode* oldLeaf = currNode->leaf_l;
+                LeafNode* leafNode = copyLeafNode(oldLeaf);
+                oldLeaf->next = leafNode;
                 currNode->leaf_e = leafNode;
+                redirectLeafLRefs(oldLeaf, leafNode, currNode);
             }
         }
     }
@@ -350,57 +476,37 @@ private:
     // InsertPredicate/DeletePredicate walk from - see this file's kGt/kLt comment above.
     // kEq carves off two new leaves, "=V" and ">V"; old leaf keeps "<V" unchanged.
     //
-    // FIX beyond the literal pseudocode, found by tracing Section 4.4's own worked
-    // example by hand and getting a wrong answer: `iLNode` found via GetRNode/GetLNode
-    // can itself be an EXISTING boundary node (not just the tree-wide root) - e.g. when
-    // 30 is inserted between already-existing boundaries at 20 and 60, iLNode resolves to
-    // 60's own boundary node, whose leaf_l WAS aliased with its own leaf_e (both pointing
-    // at the single undivided "[20,60]" leaf, from 60's own earlier <=-style insertion).
-    // The literal pseudocode reassigns iLNode.l to the freshly split-off leaf but never
-    // touches iLNode.e, leaving it stale (still pointing at what is now only "[20,30)"
-    // instead of the "[30,60]" piece that actually covers value 60). Fixed by propagating
-    // the SAME reassignment to iLNode.e whenever it was aliased with the old iLNode.l -
-    // deliberately NOT propagating to iLNode.g (see below) or to root_ specifically (root_
-    // has no leaf_e at all - it's always null - so the `== oldLeaf` check is naturally a
-    // no-op there without needing a special case).
-    //
-    // iLNode.g is never aliased with iLNode.l for any non-root node by construction (a
-    // kGe-created node has leaf_e==leaf_g, never leaf_l; a kLe-created node has
-    // leaf_l==leaf_e, never leaf_g; a kEq-created node has all three distinct) - the ONLY
-    // place leaf_l and leaf_g start equal is root_ itself (both = the single initial leaf,
-    // at construction), and that aliasing is purely incidental: root_.g means "first
-    // (leftmost) leaf" and root_.l means "last (rightmost) leaf", two genuinely different
-    // semantic positions that must stop tracking each other the moment the first real
-    // split happens - propagating to .g there would be wrong, so this fix deliberately
-    // never does.
+    // Every branch calls redirectLeafLRefs on oldLeaf at the end - see file-level comment
+    // #3: iLNode itself is always among oldLeaf's referrers (that's how it was found), so
+    // the redirect naturally updates it (and its `.leaf_e` if that was self-aliased too),
+    // exactly reproducing what the literal pseudocode's own `iLNode.l = ...` line intended
+    // - plus correctly fixing up any OTHER already-existing node sharing the same stale
+    // reference, which the literal pseudocode has no mechanism for at all.
     void partitionLeafNodeLeft(InnerNode* currNode, InnerNode* iLNode, Op op) {
         LeafNode* oldLeaf = iLNode->leaf_l;
         if (op == Op::kGe) {
             LeafNode* leafNode = copyLeafNode(oldLeaf);
             oldLeaf->next = leafNode;
-            currNode->leaf_l = oldLeaf;
+            setLeafL(currNode, oldLeaf);
             currNode->leaf_e = leafNode;
             currNode->leaf_g = leafNode;
-            if (iLNode->leaf_e == oldLeaf) iLNode->leaf_e = leafNode;
-            iLNode->leaf_l = leafNode;
+            redirectLeafLRefs(oldLeaf, leafNode, currNode);
         } else if (op == Op::kLe) {
             LeafNode* leafNode = copyLeafNode(oldLeaf);
             oldLeaf->next = leafNode;
-            currNode->leaf_l = oldLeaf;
+            setLeafL(currNode, oldLeaf);
             currNode->leaf_e = oldLeaf;
             currNode->leaf_g = leafNode;
-            if (iLNode->leaf_e == oldLeaf) iLNode->leaf_e = leafNode;
-            iLNode->leaf_l = leafNode;
+            redirectLeafLRefs(oldLeaf, leafNode, currNode);
         } else if (op == Op::kEq) {
             LeafNode* leafNodeOne = copyLeafNode(oldLeaf);
             LeafNode* leafNodeTwo = copyLeafNode(oldLeaf);
             oldLeaf->next = leafNodeOne;
             leafNodeOne->next = leafNodeTwo;
-            currNode->leaf_l = oldLeaf;
+            setLeafL(currNode, oldLeaf);
             currNode->leaf_e = leafNodeOne;
             currNode->leaf_g = leafNodeTwo;
-            if (iLNode->leaf_e == oldLeaf) iLNode->leaf_e = leafNodeTwo;
-            iLNode->leaf_l = leafNodeTwo;
+            redirectLeafLRefs(oldLeaf, leafNodeTwo, currNode);
         }
     }
 

@@ -13,10 +13,13 @@ existing codebase.
 
 ## Status
 
-**Phase 1 in progress**: the PS-Tree index itself (Algorithms 1-3 - `InsertPredicate`, `MatchPair`,
-`DeletePredicate`) is implemented, tested against the paper's own worked examples, and clean under
-ASan+UBSan. PSTDynamic (Algorithms 4-6, the actual matching engine built on top) and PSTParallel
-(Algorithm 7, the multicore extension) are not yet started.
+**Phase 1 complete**: the PS-Tree index itself (Algorithms 1-3 - `InsertPredicate`, `MatchPair`,
+`DeletePredicate`), including strict `>`/`<` support, domain-boundary edge cases, and a randomized
+property-based stress test (checked against a brute-force oracle across dozens of seeds and
+thousands of operations each) validating the whole insert/delete/match pipeline, not just the
+worked examples. Clean under ASan+UBSan with leak detection. PSTDynamic (Algorithms 4-6, the actual
+matching engine built on top) and PSTParallel (Algorithm 7, the multicore extension) are not yet
+started.
 
 ## Design notes and deliberate deviations from the paper
 
@@ -31,23 +34,31 @@ against the paper's own worked examples rather than assumed. See the top-of-file
   via the standard order-preserving "sortable bit pattern" bijection (the same trick radix sort
   uses for signed integers and IEEE-754 floats), then uniformly chunked into 4-bit elements - one
   shared mechanism instead of a bespoke split per type.
-- **Only `>=`, `=`, `<=`, and `in` (BETWEEN) are implemented** - the four operators the paper's own
-  Algorithms 1 and 3 actually give pseudocode for. Strict `>`/`<` are handled one layer up (not yet
-  built - see PSTDynamic's TODO) via adjacent-key normalization (`>V` becomes `>=next(V)`), since
-  every value type here has a well-defined discrete successor.
+- **The four operators the paper's own Algorithms 1 and 3 give pseudocode for** (`>=`, `=`, `<=`,
+  `in`/BETWEEN) are implemented directly; strict `>`/`<` are supported too, via adjacent-key
+  normalization (`>V` becomes `>=next(V)`) rather than separately-derived tree wiring, since every
+  value type here has a well-defined discrete successor (`order_key.hpp`'s
+  `nextElementKey`/`prevElementKey` - ordinary mixed-radix increment/decrement, generic across every
+  codec).
 - **`MatchPair` (Algorithm 2, line 8)**: the paper prints `GetLNode(currNode, ...)`; the surrounding
   prose and Algorithm 1's own identical two-step pattern both point to `GetLNode(iRNode, ...)`
   being correct instead - implemented that way.
 - **`DeletePredicate` (Algorithm 3, line 19)**: the paper prints `if lNode.predCounter = 0`, an
   undefined variable - clearly meant to be `startNode`, the variable decremented on the previous
   line.
-- **A real gap beyond either of those**, found by hand-tracing the paper's own Section 4.4 example
-  and getting a wrong answer before fixing it: `PartitionLeafNodeLeft`'s literal pseudocode only
-  updates the found anchor node's `.l` link when splitting a leaf, never propagating to `.e` - but
-  `.e` can be aliased with `.l` on a node created by an earlier `<=`-style insertion, and leaving it
-  stale produces wrong `MatchPair` results for that earlier boundary. Fixed by propagating the
-  reassignment to `.e` whenever it was aliased with the old `.l` value (deliberately not to `.g`,
-  which is never meaningfully aliased with `.l` outside the tree-wide root - see the code comment).
+- **A real, deeper gap in both `PartitionLeafNodeLeft` and `PartitionLeafNodeEqual`**: neither
+  function's literal pseudocode updates any node other than the one it's directly operating on when
+  splitting a leaf - but `GetLNode`'s own search (invoked by an insertion at some OTHER, unrelated
+  value) can permanently wire an already-existing node's `.l` link directly to a leaf that a LATER,
+  completely unrelated insertion then splits, leaving that reference stale. Found in two stages:
+  first by hand-tracing Section 4.4's own worked example (a `.e` self-alias on the SAME node going
+  stale), then - after that fix still left a subtler case unhandled - by a randomized property test
+  that found a second instance involving a WHOLLY UNRELATED node's `.l`, wired up by its own earlier
+  insertion. Fixed generally, not case-by-case: every `LeafNode` tracks which `InnerNode`s currently
+  point to it via `.l` (`l_refs`), so every split can correctly redirect every such reference to the
+  new "rightward" piece - see `ps_tree.hpp`'s `setLeafL`/`redirectLeafLRefs` and file-level comment
+  #3 for the full reasoning, including why every referrer is guaranteed to need the redirect (not
+  just some of them).
 - **Space merging is deferred**: the paper describes `MergeSpaces` (combining adjacent leaves that
   end up with equal predicate counters after a deletion) only as prose with a worked example -
   no pseudocode is given anywhere. `DeletePredicate` here does the well-specified part (decrementing
@@ -75,6 +86,8 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
 
 ## TODO
 
+- [x] PS-Tree core (`InsertPredicate`/`MatchPair`/`DeletePredicate`), strict `>`/`<`, domain-edge
+      cases, randomized stress testing.
 - [ ] PSTDynamic (Algorithms 4-6): access-predicate selection, dimension-signature (Bloom filter)
       grouping, `InsertSubscription`/`MatchEvent`/`DeleteSubscription`, own predicate evaluator.
 - [ ] `list_valued` attribute support (nats_sidecar's `string_list`/`integer_list` - no direct
@@ -82,3 +95,5 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
 - [ ] `nats_sidecar` integration as a third pluggable matching engine.
 - [ ] PSTParallel (Algorithm 7) - a much bigger, separate architectural lift, deliberately not
       scoped yet.
+- [ ] Space merging / zero-counter leaf reclamation (deferred, see design notes above) - not a
+      correctness requirement, but real memory growth under long-running insert/delete churn.

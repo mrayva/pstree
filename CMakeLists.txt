@@ -37,6 +37,8 @@ endfunction()
 set(PSTREE_UNIT_TESTS
     test_order_key
     test_ps_tree
+    test_edge_cases
+    test_random_stress
 )
 
 foreach(test_name IN LISTS PSTREE_UNIT_TESTS)
