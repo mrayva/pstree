@@ -69,10 +69,23 @@
 // well-specified part (decrementing counters, and leaving a leaf's counter at zero once
 // nothing covers it) and leaves both actual merging AND freeing zero-counter leaves as
 // follow-up work (freeing one safely needs the same inner-node rewiring merging would).
+//
+// 4. Phase 2 (PSTDynamic) needs to attach its own per-leaf metadata (which subscriptions
+//    are grouped here, by dimension signature) - discovered, while building it, that a
+//    leaf's OWN IDENTITY (the LeafNode object a subscription got attached to at insert
+//    time) is not stable: a LATER, wholly unrelated subscription's insertion can split that
+//    same leaf into two, exactly like predCounter already needs to be (and is) copied to
+//    the new piece - but nothing propagated a subscription-tracking side-table keyed by
+//    LeafNode* the same way. LeafNode::userData plus the clone/destroy hooks below exist
+//    specifically to fix this class of bug generically, without PS-Tree needing to know
+//    anything about subscriptions or dimension signatures itself: copyLeafNode() clones
+//    userData exactly when it copies predCounter, so whatever the upper layer attaches
+//    automatically follows every split the same way the counter does.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -103,9 +116,11 @@ struct LeafNode {
     // split correctly find and fix up every stale `.l` reference, not just the one node
     // the immediate caller already knows about - see file-level comment #3.
     std::vector<InnerNode*> l_refs;
-    // Placeholder for Phase 2's own grouped subscription structure (dimension-signature
-    // groups). Phase 1 has no subscription semantics yet - callers of insertPredicate get
-    // back the affected LeafNode pointers directly and may attach whatever they like.
+    // Opaque slot for an upper layer's own per-leaf data (see file-level comment #4) - NOT
+    // interpreted by PS-Tree itself. Owned according to whatever clone/destroy hooks the
+    // PSTree instance was constructed with (both default to no-ops, so plain Phase 1 usage
+    // with no attached data is completely unaffected: userData just stays null forever).
+    void* userData = nullptr;
 };
 
 struct InnerNode {
@@ -128,7 +143,17 @@ struct Predicate {
 
 class PSTree {
 public:
-    explicit PSTree(KeyShape shape) : shape_(std::move(shape)) {
+    // See file-level comment #4: `cloneUserData` is invoked by copyLeafNode() whenever a
+    // leaf is split, to produce the new leaf's own independent copy of the source's
+    // userData (called with nullptr if the source has none, expected to return nullptr in
+    // that case too - not skipped, so a caller relying on a non-null default can still get
+    // one). `destroyUserData` is invoked when a leaf is freed. Both default to no-ops; a
+    // PSTree constructed without them behaves exactly as if userData didn't exist at all.
+    using CloneUserData = std::function<void*(void*)>;
+    using DestroyUserData = std::function<void(void*)>;
+
+    explicit PSTree(KeyShape shape, CloneUserData cloneUserData = {}, DestroyUserData destroyUserData = {})
+        : shape_(std::move(shape)), cloneUserData_(std::move(cloneUserData)), destroyUserData_(std::move(destroyUserData)) {
         root_ = new InnerNode();
         root_->p.assign(levelRadix(0), nullptr);
         // Root's own boundary leaves: g links to the first (leftmost) predicate space,
@@ -293,6 +318,8 @@ public:
 private:
     KeyShape shape_;
     InnerNode* root_;
+    CloneUserData cloneUserData_;
+    DestroyUserData destroyUserData_;
 
     std::uint32_t levelRadix(std::size_t level) const { return shape_.radix.at(level); }
 
@@ -302,11 +329,13 @@ private:
     // what makes the 3-leaf kEq/kIn split (partitionLeafNodeLeft) correct without an
     // explicit final assignment: both new leaves are copied from the same source before
     // either's `next` is touched, so the second (last) one already inherits the source's
-    // original downstream link.
-    static LeafNode* copyLeafNode(LeafNode* src) {
+    // original downstream link. Also clones `userData` (see file-level comment #4) - not a
+    // static function anymore because of this, it needs the instance's own clone hook.
+    LeafNode* copyLeafNode(LeafNode* src) {
         auto* dst = new LeafNode();
         dst->predCounter = src->predCounter;
         dst->next = src->next;
+        dst->userData = cloneUserData_ ? cloneUserData_(src->userData) : nullptr;
         return dst;
     }
 
@@ -514,6 +543,7 @@ private:
         LeafNode* leaf = root_ != nullptr ? root_->leaf_g : nullptr;
         while (leaf != nullptr) {
             LeafNode* next = leaf->next;
+            if (destroyUserData_) destroyUserData_(leaf->userData);
             delete leaf;
             leaf = next;
         }

@@ -17,9 +17,21 @@ existing codebase.
 `DeletePredicate`), including strict `>`/`<` support, domain-boundary edge cases, and a randomized
 property-based stress test (checked against a brute-force oracle across dozens of seeds and
 thousands of operations each) validating the whole insert/delete/match pipeline, not just the
-worked examples. Clean under ASan+UBSan with leak detection. PSTDynamic (Algorithms 4-6, the actual
-matching engine built on top) and PSTParallel (Algorithm 7, the multicore extension) are not yet
-started.
+worked examples.
+
+**Phase 2 complete**: PSTDynamic (Algorithms 4-6 - `InsertSubscription`, `MatchEvent`,
+`DeleteSubscription`), including the access-predicate selectivity heuristic, dimension-signature
+(Bloom filter) grouping with real hysteresis on grow/shrink, the full Section 2.1 predicate
+language (`<,<=,=,!=,>,>=`, BETWEEN, element-of/not-element-of) with its own evaluator, and a
+randomized property-based stress test. Verified against the paper's own Fig. 3 worked example
+(all 6 subscriptions - `SelectAccPred` reproduces the paper's own stated access-predicate choice
+for every one of them, not just a plausible-looking one) and Section 5.3's event-matching
+walkthrough.
+
+Both phases are clean under ASan+UBSan with leak detection, in CI and via ad-hoc extended
+multi-seed runs (60+ seeds, up to 3000 operations each) before being considered solid enough to
+build on. PSTParallel (Algorithm 7, the multicore extension) is deliberately not started - see the
+plan/TODO below.
 
 ## Design notes and deliberate deviations from the paper
 
@@ -65,6 +77,47 @@ against the paper's own worked examples rather than assumed. See the top-of-file
   counters) and leaves both merging and freeing zero-counter leaves as follow-up work - skipping
   them doesn't break `MatchPair`'s correctness, only forgoes a memory-compaction opportunity.
 
+### PSTDynamic (Phase 2) - see `pst_dynamic.hpp`'s own file-level comment for full detail
+
+- **Dimension signatures cover every dimension a subscription has a predicate on, including the
+  access predicate's own dimension** - confirmed directly from Fig. 3's own worked example (S1/S2
+  have predicates on `{attr1,attr2}`, signature `"110"`; not just the "other" dimension). The
+  paper gives no pseudocode for the Bloom filter itself; this implementation uses standard
+  Kirsch-Mitzenmacher double hashing and is verified against the worked example at the semantic
+  level (which subscriptions land in the same vs. different groups), not by trying to reproduce
+  its specific, hash-function-dependent bit strings.
+- **Grow/shrink uses two deliberately-separated threshold functions, not the paper's one
+  `thresholds[DimSigLen]` array reused for both directions** - reusing one array for both the grow
+  check (`Algorithm 4`) and the shrink check (`Algorithm 6`, evaluated at whatever length growth
+  just changed it to) risks immediate thrashing unless the thresholds happen to already have
+  hysteresis built in, which the paper never specifies. This implementation grows at
+  `capacity(len)` and only shrinks once **below** `capacity(len)/4`, giving real hysteresis by
+  construction.
+- **A real architectural gap found by the randomized stress test, not a hand-traced example this
+  time**: PSTDynamic needs to attach its own per-leaf metadata (which subscriptions are grouped
+  there) to PS-Tree leaves - but a leaf's identity isn't stable, the same way `predCounter` already
+  isn't: a *later, wholly unrelated* subscription's insertion can split a leaf that an *earlier*
+  subscription is already grouped under, and nothing propagated that grouping to the new piece.
+  Fixed by extending `ps_tree.hpp` itself with a generic, opaque `LeafNode::userData` slot plus
+  clone/destroy hooks supplied to `PSTree`'s constructor - `copyLeafNode()` clones `userData`
+  exactly when it clones `predCounter`, so whatever PSTDynamic attaches automatically follows
+  every split the same way the counter does. This keeps PS-Tree itself fully generic (it never
+  interprets what's attached) while making the upper layer's metadata correctly survive a leaf
+  split it has no way to observe directly.
+- **`kElemOf`'s literal value list is deduplicated by encoded key before building tree
+  predicates** - a repeated literal (e.g. `['ee','ee']`) would otherwise insert `kEq(V)` twice,
+  returning the same leaf twice in the affected-leaf union and double-counting the subscription in
+  its own group. Also caught by the randomized stress test (its random generator can produce
+  duplicate literals), not anticipated in advance.
+- **`kNe`/`kNotElemOf`, if selected as the (least-bad available) access predicate**, have no
+  representable contiguous PS-Tree range at all - handled by inserting `>=` the dimension's
+  minimum representable value, i.e. "matches every leaf": correct (never a false negative) but
+  forgoes pruning, exactly the outcome Section 2.3's own selectivity ranking anticipates for these
+  operators.
+- **`list_valued` attributes are not supported** (nats_sidecar's `string_list`/`integer_list`) -
+  the paper's model has no analog (an event attribute is always a single value, never a list) -
+  real follow-up work for the `nats_sidecar` integration phase, not assumed solved.
+
 ## Building
 
 ```bash
@@ -88,7 +141,7 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
 
 - [x] PS-Tree core (`InsertPredicate`/`MatchPair`/`DeletePredicate`), strict `>`/`<`, domain-edge
       cases, randomized stress testing.
-- [ ] PSTDynamic (Algorithms 4-6): access-predicate selection, dimension-signature (Bloom filter)
+- [x] PSTDynamic (Algorithms 4-6): access-predicate selection, dimension-signature (Bloom filter)
       grouping, `InsertSubscription`/`MatchEvent`/`DeleteSubscription`, own predicate evaluator.
 - [ ] `list_valued` attribute support (nats_sidecar's `string_list`/`integer_list` - no direct
       analog in the paper's single-attribute-value-pair model).

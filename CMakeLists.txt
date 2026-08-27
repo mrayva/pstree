@@ -39,6 +39,10 @@ set(PSTREE_UNIT_TESTS
     test_ps_tree
     test_edge_cases
     test_random_stress
+    test_predicate
+    test_dim_sig
+    test_pst_dynamic
+    test_pst_dynamic_stress
 )
 
 foreach(test_name IN LISTS PSTREE_UNIT_TESTS)
