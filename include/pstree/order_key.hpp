@@ -20,10 +20,12 @@
 // implement and reason about, and still isolates value-type/operator details from the
 // upper PSTDynamic layer exactly as Section 4.5 intends.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -33,8 +35,152 @@
 namespace pstree {
 
 // One decomposed value: a fixed-length sequence of element indices, one per tree level,
-// each in [0, radix_at_that_level).
-using ElementKey = std::vector<std::uint16_t>;
+// each in [0, radix_at_that_level). Small-vector-optimized: inline storage for up to
+// kInlineCapacity elements, which covers int64_t/double (always exactly 16) and bool
+// (always exactly 1) with ZERO heap allocation - only StringCodec's longer keys (up to its
+// configured max_length, e.g. 128 in nats_sidecar's usage) spill to the heap, same as
+// before. Found via `perf annotate` on nats_sidecar's matching_engine_bench (real NYSE
+// fleet-scale run): every single MatchEvent call encodes its event value into a fresh
+// ElementKey before any matching can happen at all, and that was a genuine, previously-
+// unexamined per-row heap allocation (a plain std::vector<uint16_t>) - unlike a-tree/be-tree,
+// which compare native values directly with no encoding step, PS-Tree's whole indexing
+// design requires this encode on every single event, so it's paid regardless of how many
+// subscriptions exist (see pst_dynamic.hpp's own architecture notes on when that tradeoff
+// pays off vs. doesn't).
+//
+// Deliberately hand-specialized to uint16_t (not a reusable SmallVector<T,N> template), and
+// simpler than PredicateList's own equivalent fix (pst_dynamic.hpp... see predicate.hpp):
+// uint16_t is trivially copyable/destructible, so this type needs no placement-new/manual-
+// destroy bookkeeping at all - plain memcpy suffices for every copy/move.
+class ElementKey {
+public:
+    static constexpr std::size_t kInlineCapacity = 16;
+
+    ElementKey() noexcept = default;
+
+    // Sized construction: `n` zero-valued elements, matching std::vector<uint16_t>(n)'s own
+    // value-initialization semantics - every real caller (chunk64, StringCodec::encode)
+    // immediately overwrites every index anyway, but zero-initializing removes any chance of
+    // a future caller reading an unwritten slot as UB.
+    explicit ElementKey(std::size_t n) {
+        reallocateDiscardingContents(n);
+        std::fill(data(), data() + n, std::uint16_t{0});
+    }
+
+    ElementKey(std::initializer_list<std::uint16_t> init) {
+        reallocateDiscardingContents(init.size());
+        std::copy(init.begin(), init.end(), data());
+    }
+
+    ElementKey(const ElementKey& other) {
+        reallocateDiscardingContents(other.size_);
+        std::memcpy(data(), other.data(), other.size_ * sizeof(std::uint16_t));
+    }
+    ElementKey(ElementKey&& other) noexcept {
+        if (other.heap_ != nullptr) {
+            heap_ = other.heap_;
+            heapCapacity_ = other.heapCapacity_;
+            size_ = other.size_;
+            other.heap_ = nullptr;
+            other.heapCapacity_ = 0;
+            other.size_ = 0;
+        } else {
+            size_ = other.size_;
+            std::memcpy(inline_, other.inline_, other.size_ * sizeof(std::uint16_t));
+            other.size_ = 0;
+        }
+    }
+
+    ElementKey& operator=(const ElementKey& other) {
+        if (this == &other) return *this;
+        reallocateDiscardingContents(other.size_);
+        std::memcpy(data(), other.data(), other.size_ * sizeof(std::uint16_t));
+        return *this;
+    }
+    ElementKey& operator=(ElementKey&& other) noexcept {
+        if (this == &other) return *this;
+        if (heap_ != nullptr) {
+            delete[] heap_;
+            heap_ = nullptr;
+            heapCapacity_ = 0;
+        }
+        if (other.heap_ != nullptr) {
+            heap_ = other.heap_;
+            heapCapacity_ = other.heapCapacity_;
+            size_ = other.size_;
+            other.heap_ = nullptr;
+            other.heapCapacity_ = 0;
+            other.size_ = 0;
+        } else {
+            size_ = other.size_;
+            std::memcpy(inline_, other.inline_, other.size_ * sizeof(std::uint16_t));
+            other.size_ = 0;
+        }
+        return *this;
+    }
+
+    ~ElementKey() {
+        if (heap_ != nullptr) delete[] heap_;
+    }
+
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+
+    std::uint16_t& operator[](std::size_t i) noexcept { return data()[i]; }
+    std::uint16_t operator[](std::size_t i) const noexcept { return data()[i]; }
+    std::uint16_t& at(std::size_t i) {
+        if (i >= size_) throw std::out_of_range("pstree::ElementKey::at");
+        return data()[i];
+    }
+    std::uint16_t at(std::size_t i) const {
+        if (i >= size_) throw std::out_of_range("pstree::ElementKey::at");
+        return data()[i];
+    }
+
+    std::uint16_t* begin() noexcept { return data(); }
+    std::uint16_t* end() noexcept { return data() + size_; }
+    const std::uint16_t* begin() const noexcept { return data(); }
+    const std::uint16_t* end() const noexcept { return data() + size_; }
+
+    bool operator==(const ElementKey& other) const noexcept {
+        if (size_ != other.size_) return false;
+        return std::memcmp(data(), other.data(), size_ * sizeof(std::uint16_t)) == 0;
+    }
+    bool operator!=(const ElementKey& other) const noexcept { return !(*this == other); }
+
+private:
+    // Raw inline storage - never placement-new'd/destroyed element-by-element, since
+    // uint16_t is trivial; only ever touched via memcpy/std::fill on the range [0, size_).
+    std::uint16_t inline_[kInlineCapacity];
+    std::uint16_t* heap_ = nullptr; // non-null once spilled to the heap
+    std::size_t heapCapacity_ = 0;  // element capacity of *heap_; meaningless while heap_ == nullptr
+    std::size_t size_ = 0;
+
+    std::uint16_t* data() noexcept { return heap_ != nullptr ? heap_ : inline_; }
+    const std::uint16_t* data() const noexcept { return heap_ != nullptr ? heap_ : inline_; }
+
+    // Ensures storage for exactly `n` elements is available and sets size_ = n, WITHOUT
+    // preserving any prior contents - every caller (construction, copy-assignment)
+    // immediately overwrites the whole range right after calling this, so there is nothing
+    // to preserve. Frees an existing heap buffer whenever `n` fits inline (no reason to keep
+    // a heap allocation alive for a key that's shrunk back into the common case), and only
+    // reallocates the heap buffer when growing past the current one's capacity.
+    void reallocateDiscardingContents(std::size_t n) {
+        if (n <= kInlineCapacity) {
+            if (heap_ != nullptr) {
+                delete[] heap_;
+                heap_ = nullptr;
+                heapCapacity_ = 0;
+            }
+        } else if (heap_ == nullptr || heapCapacity_ < n) {
+            auto* newBuf = new std::uint16_t[n];
+            if (heap_ != nullptr) delete[] heap_;
+            heap_ = newBuf;
+            heapCapacity_ = n;
+        }
+        size_ = n;
+    }
+};
 
 // Describes the shape of a value type's decomposition: how many elements (tree depth) and
 // the branching factor (radix) at each level. Shared by every value of that type.
