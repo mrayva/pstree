@@ -240,7 +240,8 @@ public:
         auto [subIt, subInserted] = subscriptions_.emplace(sub.id, sub);
         const Subscription* subPtr = &subIt->second;
 
-        std::vector<LeafNode*> leafNodes = applyToTree(dim, accPred, /*insert=*/true);
+        auto lowLevel = buildLowLevel(dim, accPred);
+        std::vector<LeafNode*> leafNodes = applyLowLevel(dim, lowLevel, /*insert=*/true);
 
         std::vector<std::string> subDims = detail::dimSigDimensions(sub);
 
@@ -305,7 +306,8 @@ public:
         const SubPredicate& accPred = sub.predicates.at(accIdx);
         DimensionIndex& dim = dimensions_.at(accPred.attr);
 
-        std::vector<LeafNode*> leafNodes = applyToTree(dim, accPred, /*insert=*/false);
+        auto lowLevel = buildLowLevel(dim, accPred);
+        std::vector<LeafNode*> leafNodes = applyLowLevel(dim, lowLevel, /*insert=*/false);
 
         std::vector<std::string> subDims = detail::dimSigDimensions(sub);
 
@@ -333,6 +335,16 @@ public:
                 state.dimSigLen -= 1;
                 reorganizeGroups(state);
             }
+        }
+
+        // Space reclamation ("MergeSpaces" - see ps_tree.hpp's own file-level comment and this
+        // repo's README "Space merging is deferred" note): now that every leaf's userData has
+        // been fully read/updated above (the ONLY reason freeing had to wait - see reclaim()'s
+        // own doc comment), it's safe to free any bucket that just dropped to a zero
+        // predCounter, and to prune any InnerNode left with nothing in it as a result. Called
+        // per low-level predicate, same as insert/delete themselves.
+        for (auto& p : lowLevel) {
+            dim.tree.reclaim(p);
         }
 
         subscriptions_.erase(subIt);
@@ -382,12 +394,11 @@ private:
     }
 
     // Builds the low-level pstree::Predicate list for one access predicate (usually one
-    // entry; kElemOf produces one kEq per literal value - see file-level comment), then
-    // applies each via PSTree's own insertPredicate/deletePredicate, unioning the affected
-    // leaves. `insert` selects which PSTree operation runs; the predicate list itself is
-    // identical either way (deterministic from `pred` and `dim.schema` alone), which is
-    // exactly what guarantees delete finds every leaf insert touched.
-    static std::vector<LeafNode*> applyToTree(DimensionIndex& dim, const SubPredicate& pred, bool insert) {
+    // entry; kElemOf produces one kEq per literal value - see file-level comment). Pure and
+    // deterministic from `pred`/`dim.schema` alone - exactly what guarantees insert and delete
+    // (and, for delete, the later reclaim() pass - see deleteSubscription) all agree on the
+    // identical decomposition.
+    static std::vector<Predicate> buildLowLevel(DimensionIndex& dim, const SubPredicate& pred) {
         std::vector<Predicate> lowLevel;
         switch (pred.op) {
             case CmpOp::kLt: {
@@ -450,8 +461,16 @@ private:
                 // own doc comments) - reaching this case means that guard was bypassed.
                 throw std::logic_error(
                     "pstree: kIsNull cannot be used as an access predicate - "
-                    "this should have been rejected before reaching applyToTree");
+                    "this should have been rejected before reaching buildLowLevel");
         }
+        return lowLevel;
+    }
+
+    // Applies a pre-built low-level predicate list (insert or delete) and unions the affected
+    // leaves - split out from buildLowLevel so deleteSubscription can hold onto the same
+    // `lowLevel` it applied here and pass it again to reclaim() afterward (see there for why
+    // that has to happen as a distinct, later step, not folded into this one).
+    static std::vector<LeafNode*> applyLowLevel(DimensionIndex& dim, const std::vector<Predicate>& lowLevel, bool insert) {
         std::vector<LeafNode*> all;
         for (auto& p : lowLevel) {
             auto leaves = insert ? dim.tree.insertPredicate(p) : dim.tree.deletePredicate(p);

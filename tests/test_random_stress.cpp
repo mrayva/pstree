@@ -119,7 +119,14 @@ void test_random_insert_delete_matches_brute_force() {
         } else {
             std::uniform_int_distribution<std::size_t> pick(0, active.size() - 1);
             std::size_t idx = pick(rng);
-            tree.deletePredicate(toPredicate(active[idx]));
+            pstree::Predicate deleted = toPredicate(active[idx]);
+            tree.deletePredicate(deleted);
+            // Exercise reclaim() on every single delete here too, not just the final drain
+            // below - this walk's own wide-range bias (30% of kGe/kLe near INT64_MIN/MAX) means
+            // predicates constantly overlap and share buckets/ancestor nodes with each other,
+            // a much more adversarial mix for reclaim's zero-check-before-free/prune logic than
+            // the isolated single-predicate cases test_ps_tree.cpp's own reclaim tests use.
+            tree.reclaim(deleted);
             active.erase(active.begin() + idx);
         }
 
@@ -140,11 +147,21 @@ void test_random_insert_delete_matches_brute_force() {
     // everywhere sampled - exercises DeletePredicate's underflow guard never firing on a
     // legitimate sequence, and confirms no coverage was ever double-counted or dropped.
     for (const auto& p : active) {
-        tree.deletePredicate(toPredicate(p));
+        pstree::Predicate deleted = toPredicate(p);
+        tree.deletePredicate(deleted);
+        tree.reclaim(deleted);
     }
     for (int q = -kValueRange; q <= kValueRange; q += 7) {
         require(sumCoverage(tree, q) == 0, "after draining all predicates, value " + std::to_string(q) + " should be uncovered");
     }
+    // Stronger than the coverage check above: after reclaiming every predicate this whole
+    // randomized walk ever inserted (hundreds of operations, heavily biased toward wide,
+    // deep, overlapping ranges), the tree's actual structure - not just observable coverage -
+    // should collapse all the way back to an empty root, same as test_ps_tree.cpp's own
+    // single-predicate reclaim tests, now proven under real adversarial churn.
+    require(tree.root()->p.empty(),
+            "after draining and reclaiming every predicate, the tree structure should be fully "
+            "pruned back to an empty root, not just zero-coverage");
 }
 
 // Direct complexity regression: a wide kGe insertion's own touched-bucket count must stay a

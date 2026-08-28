@@ -81,13 +81,22 @@ against before implementation) already caught:
   running the same GE-style decomposition starting past the end of the key silently does nothing,
   losing lo's own inclusion entirely. The whole range collapses to one inclusive bounded marker at
   the shared ancestor node instead.
-- **Buckets are deliberately never freed when their `predCounter` reaches zero, unlike an earlier
-  draft of this design.** PSTDynamic's own per-bucket group state (`LeafNode::userData`) is read
-  and mutated by the *caller* strictly after `insertPredicate`/`deletePredicate` returns the bucket
-  list - freeing a zero-counter bucket eagerly, inside the delete call itself, would leave that
-  access reading freed memory. A zero-counter "zombie" bucket costs a small, bounded amount of
-  memory (mirroring the original leaf-chain design's own deferred "MergeSpaces" stance, just for a
-  different underlying reason) and is otherwise harmless.
+- **Buckets are never freed *inline* by `deletePredicate`, unlike an earlier draft of this design -
+  but they ARE reclaimed, via a separate `PSTree::reclaim(pred)` call (2026-08-28).** PSTDynamic's
+  own per-bucket group state (`LeafNode::userData`) is read and mutated by the *caller* strictly
+  after `insertPredicate`/`deletePredicate` returns the bucket list - freeing a zero-counter bucket
+  eagerly, inside the delete call itself, would leave that access reading freed memory. `reclaim()`
+  re-walks the identical deterministic decomposition a second time, freeing any bucket that reached
+  zero (checked at that point, not assumed) and pruning any `InnerNode` left with no children and no
+  markers as a result, all the way back up to (not including) the root - `PSTDynamic::deleteSubscription`
+  calls it once per low-level predicate, right after its own group-bookkeeping loop is done reading
+  every leaf's `userData` for that delete, which is the earliest point it's safe. See
+  `ps_tree.hpp`'s own file-level comment and doc comment on `reclaim()` for the full reasoning,
+  and `tests/test_ps_tree.cpp`'s dedicated reclaim tests (zombie-bucket freeing, empty-InnerNode
+  pruning back to an empty root, a shared bucket staying alive until its last reference is gone,
+  BETWEEN's own lca/branch structure, idempotence) plus `test_random_stress.cpp`'s adversarial
+  randomized walk (wide/overlapping ranges, reclaiming after every delete, asserting the tree
+  structure - not just coverage - returns to an empty root once everything is drained).
 - **`boundedMarkers`' linear scan is real, tracked residual debt**, not swept under "not reachable
   today": if many BETWEEN predicates ever shared the same LCA node, that node's scan would
   reintroduce an O(K)-shaped cost for that one operator specifically. Confirmed unreachable from
@@ -147,6 +156,11 @@ by the redesign; briefly, on the now-superseded original design:
   no pseudocode is given anywhere. `DeletePredicate` here does the well-specified part (decrementing
   counters) and leaves both merging and freeing zero-counter leaves as follow-up work - skipping
   them doesn't break `MatchPair`'s correctness, only forgoes a memory-compaction opportunity.
+  (Historical note: this whole leaf-chain design, `MergeSpaces` included, is superseded by the
+  canonical-ancestor-marker redesign above - there is no leaf chain or "adjacent leaves" concept
+  left to merge. The live equivalent of this deferred item - freeing zero-`predCounter` buckets
+  and pruning now-empty `InnerNode`s in the current bucket model - is fixed; see `PSTree::reclaim()`
+  above, not this historical section.)
 
 ### PSTDynamic (Phase 2) - see `pst_dynamic.hpp`'s own file-level comment for full detail
 

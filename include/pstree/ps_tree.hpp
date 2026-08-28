@@ -241,7 +241,8 @@ public:
     // find doesn't exist - deleting a predicate that was never inserted, or double-deleting
     // one). Returns every bucket touched, in the same shape insertPredicate would have
     // produced for the identical `pred`. Buckets are not freed here - see the file-level
-    // comment.
+    // comment; call reclaim() with the same `pred` once the caller is done reading every
+    // returned bucket's userData, to actually free any that reached zero.
     std::vector<LeafNode*> deletePredicate(const Predicate& pred) {
         switch (pred.op) {
             case Op::kEq:
@@ -264,6 +265,46 @@ public:
                 return deleteBetween(pred.vals0, pred.vals1);
         }
         return {};
+    }
+
+    // Frees every zero-predCounter bucket `pred`'s decomposition touches, and prunes any
+    // InnerNode left with no children and no markers as a result (walking back up along the
+    // same path) - the actual space-reclamation half of what deletePredicate defers. See the
+    // file-level comment's "zombie bucket" note for why this MUST be a separate call, invoked
+    // only once the caller is completely done reading every bucket deletePredicate returned
+    // (its own userData in particular) for THIS predicate - calling it any earlier is exactly
+    // the use-after-free deletePredicate itself avoids by not freeing inline.
+    //
+    // Deliberately tolerant, unlike deletePredicate: re-walks the identical deterministic path,
+    // but a missing bucket/child along the way just means "nothing left to reclaim here" (already
+    // freed by an earlier reclaim() call, e.g. a sibling predicate from the same kElemOf
+    // decomposition sharing a path prefix), not an error - safe to call multiple times, or on a
+    // predicate whose buckets never accumulated any zero-counter garbage in the first place.
+    void reclaim(const Predicate& pred) {
+        switch (pred.op) {
+            case Op::kEq:
+                reclaimEq(pred.vals0);
+                return;
+            case Op::kGe:
+                reclaimGeTop(pred.vals0);
+                return;
+            case Op::kGt: {
+                auto next = nextElementKey(shape_, pred.vals0);
+                if (next) reclaimGeTop(*next);
+                return;
+            }
+            case Op::kLe:
+                reclaimLeTop(pred.vals0);
+                return;
+            case Op::kLt: {
+                auto prev = prevElementKey(shape_, pred.vals0);
+                if (prev) reclaimLeTop(*prev);
+                return;
+            }
+            case Op::kIn:
+                reclaimBetween(pred.vals0, pred.vals1);
+                return;
+        }
     }
 
     const KeyShape& shape() const { return shape_; }
@@ -544,6 +585,156 @@ private:
         result.insert(result.end(), hiResults.begin(), hiResults.end());
 
         return result;
+    }
+
+    // Frees `bucket` (calling destroyUserData_ first) and erases it from `markers` iff its
+    // predCounter has reached zero - i.e. no predicate, from this delete or any other still-live
+    // one, references it anymore. A missing threshold is silently ignored (see reclaim()'s own
+    // tolerance note).
+    void freeMarkerIfZero(std::map<std::uint16_t, LeafNode*>& markers, std::uint16_t threshold) {
+        auto it = markers.find(threshold);
+        if (it == markers.end()) return;
+        if (it->second->predCounter != 0) return;
+        if (destroyUserData_) destroyUserData_(it->second->userData);
+        delete it->second;
+        markers.erase(it);
+    }
+
+    void freeBoundedMarkerIfZero(InnerNode* node, std::uint16_t lo, std::uint16_t hi) {
+        for (auto it = node->boundedMarkers.begin(); it != node->boundedMarkers.end(); ++it) {
+            if (std::get<0>(*it) != lo || std::get<1>(*it) != hi) continue;
+            LeafNode* bucket = std::get<2>(*it);
+            if (bucket->predCounter == 0) {
+                if (destroyUserData_) destroyUserData_(bucket->userData);
+                delete bucket;
+                node->boundedMarkers.erase(it);
+            }
+            return;
+        }
+    }
+
+    static bool nodeIsEmpty(const InnerNode* node) {
+        return node->p.empty() && node->geMarkers.empty() && node->leMarkers.empty() &&
+               node->boundedMarkers.empty();
+    }
+
+    void reclaimEq(const ElementKey& v) {
+        auto it = equality_.find(v);
+        if (it == equality_.end() || it->second->predCounter != 0) return;
+        if (destroyUserData_) destroyUserData_(it->second->userData);
+        delete it->second;
+        equality_.erase(it);
+    }
+
+    // Mirrors geFrom's own top-down walk, but recurses to the deepest level FIRST so it can
+    // prune a now-fully-empty child (no markers, no children of its own) on the way back up,
+    // exactly like a normal post-order tree-node reclaim. Returns whether `node` itself ends up
+    // empty afterward, so the CALLER (one level up, or reclaimGeTop for the root) can decide
+    // whether the edge leading to `node` should be pruned too - root is never pruned (there is
+    // no edge leading to it).
+    bool reclaimGe(InnerNode* node, const ElementKey& v, std::size_t level) {
+        const std::size_t depth = v.size();
+        std::uint16_t d = v[level];
+        if (level == depth - 1) {
+            freeMarkerIfZero(node->geMarkers, d);
+        } else {
+            auto childIt = node->p.find(d);
+            if (childIt != node->p.end()) {
+                if (reclaimGe(childIt->second, v, level + 1)) {
+                    delete childIt->second;
+                    node->p.erase(childIt);
+                }
+            }
+            if (static_cast<std::uint32_t>(d) + 1 < levelRadix(level)) {
+                freeMarkerIfZero(node->geMarkers, static_cast<std::uint16_t>(d + 1));
+            }
+        }
+        return nodeIsEmpty(node);
+    }
+
+    bool reclaimLe(InnerNode* node, const ElementKey& v, std::size_t level) {
+        const std::size_t depth = v.size();
+        std::uint16_t d = v[level];
+        if (level == depth - 1) {
+            freeMarkerIfZero(node->leMarkers, d);
+        } else {
+            auto childIt = node->p.find(d);
+            if (childIt != node->p.end()) {
+                if (reclaimLe(childIt->second, v, level + 1)) {
+                    delete childIt->second;
+                    node->p.erase(childIt);
+                }
+            }
+            if (d > 0) {
+                freeMarkerIfZero(node->leMarkers, static_cast<std::uint16_t>(d - 1));
+            }
+        }
+        return nodeIsEmpty(node);
+    }
+
+    void reclaimGeTop(const ElementKey& v) { reclaimGe(root_, v, 0); }
+    void reclaimLeTop(const ElementKey& v) { reclaimLe(root_, v, 0); }
+
+    // BETWEEN's own mirror of reclaimGe/reclaimLe - see insertBetween/deleteBetween for the
+    // lcaLevel derivation this follows exactly. `reclaimBetweenPrefix` walks the shared
+    // lo[0..lcaLevel) descend-only prefix (no marker at those levels, same as insert/delete),
+    // recursing to the lca node first so the prefix can be pruned bottom-up same as reclaimGe/Le.
+    bool reclaimBetweenAtLca(InnerNode* node, const ElementKey& lo, const ElementKey& hi, std::size_t lcaLevel) {
+        const std::size_t depth = lo.size();
+        std::uint16_t loD = lo[lcaLevel];
+        std::uint16_t hiD = hi[lcaLevel];
+
+        if (lcaLevel == depth - 1) {
+            freeBoundedMarkerIfZero(node, loD, hiD);
+            return nodeIsEmpty(node);
+        }
+
+        if (static_cast<std::uint32_t>(loD) + 1 <= static_cast<std::uint32_t>(hiD) - 1) {
+            freeBoundedMarkerIfZero(node, static_cast<std::uint16_t>(loD + 1), static_cast<std::uint16_t>(hiD - 1));
+        }
+
+        auto loIt = node->p.find(loD);
+        if (loIt != node->p.end()) {
+            if (reclaimGe(loIt->second, lo, lcaLevel + 1)) {
+                delete loIt->second;
+                node->p.erase(loIt);
+            }
+        }
+        auto hiIt = node->p.find(hiD);
+        if (hiIt != node->p.end()) {
+            if (reclaimLe(hiIt->second, hi, lcaLevel + 1)) {
+                delete hiIt->second;
+                node->p.erase(hiIt);
+            }
+        }
+        return nodeIsEmpty(node);
+    }
+
+    bool reclaimBetweenPrefix(InnerNode* node, const ElementKey& lo, const ElementKey& hi,
+                               std::size_t level, std::size_t lcaLevel) {
+        if (level == lcaLevel) {
+            return reclaimBetweenAtLca(node, lo, hi, lcaLevel);
+        }
+        std::uint16_t d = lo[level]; // == hi[level] below lcaLevel, by lcaLevel's own definition
+        auto childIt = node->p.find(d);
+        if (childIt != node->p.end()) {
+            if (reclaimBetweenPrefix(childIt->second, lo, hi, level + 1, lcaLevel)) {
+                delete childIt->second;
+                node->p.erase(childIt);
+            }
+        }
+        return nodeIsEmpty(node);
+    }
+
+    void reclaimBetween(const ElementKey& lo, const ElementKey& hi) {
+        if (lo == hi) {
+            reclaimEq(lo);
+            return;
+        }
+        const std::size_t depth = lo.size();
+        std::size_t lcaLevel = 0;
+        while (lcaLevel < depth && lo[lcaLevel] == hi[lcaLevel]) ++lcaLevel;
+        reclaimBetweenPrefix(root_, lo, hi, 0, lcaLevel);
     }
 
     void destroy() {

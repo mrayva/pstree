@@ -198,6 +198,138 @@ void test_single_predicate_round_trips_bool() {
     require(sum(true) == 0, "bool kEq true: deleted, back to 0");
 }
 
+// --- reclaim() ("space merging" / zombie-bucket + empty-InnerNode reclamation) ---
+//
+// matchPoint() itself doesn't distinguish a live bucket from a zero-predCounter "zombie" one -
+// both are returned, just with different predCounter values (see its own loop: it pushes every
+// bucket a marker's threshold range covers, unconditionally) - so these tests count
+// tree.matchPoint(v).size() (how many buckets a point currently resolves to, zombie or not)
+// rather than sumCoverage() (total predCounter) to observe whether reclaim() actually removed
+// the zombie bucket's own map/vector entry, not just zeroed its counter.
+
+int g_destroyCount = 0;
+void countingDestroy(void*) { g_destroyCount++; }
+
+void test_reclaim_frees_zombie_bucket_after_delete() {
+    g_destroyCount = 0;
+    pstree::PSTree tree(pstree::Int64Codec::shape(), countingDestroy);
+    pstree::Predicate p{pstree::Op::kGe, pstree::Int64Codec::encode(10), {}};
+
+    // A GE insert on a 16-level digit-trie touches one marker per level it descends through
+    // (see ps_tree.hpp's own geFrom) - not necessarily just one bucket; the exact count depends
+    // on value 10's own encoded digit path, so this only asserts it's nonzero, not a fixed number.
+    auto leaves = tree.insertPredicate(p);
+    require(!leaves.empty(), "kGe(10): at least one bucket touched");
+    std::size_t touched = leaves.size();
+
+    // matchPoint(10) itself only ever resolves to the ONE final-level (exact-match) bucket -
+    // geFrom's other, intermediate-level "sibling" markers cover values strictly GREATER than
+    // 10 at their own level (see ps_tree.hpp's own file-level comment), not 10 itself - so this
+    // checks 1, not `touched`; g_destroyCount (below) is what actually confirms every one of
+    // the `touched` buckets gets freed, not just the one matchPoint(10) can see directly.
+    require(tree.matchPoint(pstree::Int64Codec::encode(10)).size() == 1,
+            "before delete: the exact-match bucket entry is still present");
+
+    tree.deletePredicate(p);
+    require(tree.matchPoint(pstree::Int64Codec::encode(10)).size() == 1,
+            "after delete, before reclaim: the now-zero-counter exact-match bucket entry is "
+            "still present (deletePredicate never frees - see ps_tree.hpp's own file-level comment)");
+    require(g_destroyCount == 0, "destroyUserData_ must not fire before reclaim() runs");
+
+    tree.reclaim(p);
+    require(g_destroyCount == static_cast<int>(touched),
+            "reclaim() should free every now-zero-counter bucket this predicate touched");
+    require(tree.matchPoint(pstree::Int64Codec::encode(10)).empty(),
+            "after reclaim: every touched bucket entry is gone, not just zero-counter");
+}
+
+void test_reclaim_prunes_empty_inner_nodes_back_to_root() {
+    pstree::PSTree tree(pstree::Int64Codec::shape());
+    pstree::Predicate p{pstree::Op::kGe, pstree::Int64Codec::encode(12345), {}};
+
+    tree.insertPredicate(p);
+    require(!tree.root()->p.empty(),
+            "sanity: a kGe insert on a 16-level digit-trie should create intermediate InnerNodes");
+
+    tree.deletePredicate(p);
+    tree.reclaim(p);
+    require(tree.root()->p.empty(),
+            "reclaim() should prune every now-empty InnerNode the insert created, all the way "
+            "back to (but not including) the root - 'recovered to a status as if the predicate "
+            "was never inserted' (paper prose), now true of the actual structure, not just "
+            "observable coverage");
+}
+
+void test_reclaim_keeps_shared_bucket_alive_until_last_reference_gone() {
+    g_destroyCount = 0;
+    pstree::PSTree tree(pstree::Int64Codec::shape(), countingDestroy);
+    // Two independent, IDENTICAL predicates (same op, same value) - deterministic decomposition
+    // means they touch the exact same set of buckets, in the same order (simulates two
+    // different subscriptions sharing the same predicate space).
+    pstree::Predicate p1{pstree::Op::kGe, pstree::Int64Codec::encode(10), {}};
+    pstree::Predicate p2{pstree::Op::kGe, pstree::Int64Codec::encode(10), {}};
+
+    auto l1 = tree.insertPredicate(p1);
+    auto l2 = tree.insertPredicate(p2);
+    require(l1 == l2, "sanity: two identical predicates should land on the identical bucket set");
+    for (auto* bucket : l1) {
+        require(bucket->predCounter == 2, "sanity: every shared bucket's counter reflects both predicates");
+    }
+    std::size_t touched = l1.size();
+
+    tree.deletePredicate(p1);
+    tree.reclaim(p1);
+    require(g_destroyCount == 0,
+            "reclaim() must NOT free a bucket that another still-live predicate (p2) still references");
+    require(tree.matchPoint(pstree::Int64Codec::encode(10)).size() == 1,
+            "exact-match bucket entry still present - p2 still covers it (see the sibling-test's "
+            "own note on why matchPoint(10) only ever shows 1, not `touched`)");
+
+    tree.deletePredicate(p2);
+    tree.reclaim(p2);
+    require(g_destroyCount == static_cast<int>(touched),
+            "reclaim() frees every bucket once the LAST referencing predicate is gone");
+    require(tree.matchPoint(pstree::Int64Codec::encode(10)).empty(), "every bucket entry now gone");
+}
+
+void test_reclaim_between_frees_bounded_marker_and_branches() {
+    pstree::PSTree tree(pstree::Int64Codec::shape());
+    pstree::Predicate p = betweenInt(20, 60); // matches test_section_4_4's own S1
+
+    tree.insertPredicate(p);
+    require(!tree.root()->p.empty(), "sanity: BETWEEN should create tree structure too");
+    require(sumCoverage(tree, 45) == 1, "sanity: midpoint covered before delete");
+
+    tree.deletePredicate(p);
+    tree.reclaim(p);
+    require(sumCoverage(tree, 45) == 0, "after reclaim: midpoint no longer covered");
+    require(tree.root()->p.empty(),
+            "reclaim() should prune BETWEEN's own lca-prefix/lo-branch/hi-branch structure "
+            "back to an empty root too, same as the plain kGe case");
+}
+
+void test_reclaim_is_idempotent_and_tolerates_already_freed_state() {
+    g_destroyCount = 0;
+    pstree::PSTree tree(pstree::Int64Codec::shape(), countingDestroy);
+    pstree::Predicate p{pstree::Op::kLe, pstree::Int64Codec::encode(-5), {}};
+
+    auto leaves = tree.insertPredicate(p);
+    require(!leaves.empty(), "sanity: kLe(-5) touches at least one bucket");
+    tree.deletePredicate(p);
+    tree.reclaim(p);
+    require(g_destroyCount == static_cast<int>(leaves.size()), "first reclaim() call frees every touched bucket");
+    tree.reclaim(p); // calling again on an already-fully-reclaimed predicate must be safe, not a double free
+    require(g_destroyCount == static_cast<int>(leaves.size()),
+            "a second reclaim() call on the same predicate is a safe no-op");
+
+    // Calling reclaim() for a predicate that still has coverage (never deleted) must be a
+    // pure no-op too - reclaim only acts on zero-predCounter buckets.
+    pstree::Predicate live{pstree::Op::kGe, pstree::Int64Codec::encode(100), {}};
+    tree.insertPredicate(live);
+    tree.reclaim(live);
+    require(sumCoverage(tree, 100) == 1, "reclaim() on a still-live predicate must not touch it");
+}
+
 } // namespace
 
 int main() {
@@ -207,6 +339,11 @@ int main() {
     test_single_predicate_round_trips_double();
     test_single_predicate_round_trips_string();
     test_single_predicate_round_trips_bool();
+    test_reclaim_frees_zombie_bucket_after_delete();
+    test_reclaim_prunes_empty_inner_nodes_back_to_root();
+    test_reclaim_keeps_shared_bucket_alive_until_last_reference_gone();
+    test_reclaim_between_frees_bounded_marker_and_branches();
+    test_reclaim_is_idempotent_and_tolerates_already_freed_state();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";
