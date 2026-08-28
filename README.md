@@ -13,6 +13,10 @@ existing codebase.
 
 ## Status
 
+**Phase 3 complete**: integrated into `mrayva/nats_sidecar` as a third pluggable matching engine
+(`engine: pstree`) - see that repo's own README.md for the operator-support/limitations summary.
+PSTParallel (Phase 4) remains deliberately not started.
+
 **Phase 1 complete**: the PS-Tree index itself (Algorithms 1-3 - `InsertPredicate`, `MatchPair`,
 `DeletePredicate`), including strict `>`/`<` support, domain-boundary edge cases, and a randomized
 property-based stress test (checked against a brute-force oracle across dozens of seeds and
@@ -154,9 +158,16 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
       cases, randomized stress testing.
 - [x] PSTDynamic (Algorithms 4-6): access-predicate selection, dimension-signature (Bloom filter)
       grouping, `InsertSubscription`/`MatchEvent`/`DeleteSubscription`, own predicate evaluator.
+- [x] `nats_sidecar` integration as a third pluggable matching engine (`engine: pstree`) - see
+      `mrayva/nats_sidecar`'s own README.md/`src/pstree_dialect.hpp` for the DNF-conversion layer
+      that bridges PSTDynamic's pure-conjunction model to nats_sidecar's full AND/OR/NOT grammar.
+      `list_valued` attribute support (below) stayed unaddressed by design - the integration
+      instead rejects any expression referencing one at subscribe time, a real limitation not an
+      omission (see nats_sidecar's own README for the full list, including `is null` alone as an
+      unindexable access predicate).
 - [ ] `list_valued` attribute support (nats_sidecar's `string_list`/`integer_list` - no direct
-      analog in the paper's single-attribute-value-pair model).
-- [ ] `nats_sidecar` integration as a third pluggable matching engine.
+      analog in the paper's single-attribute-value-pair model) - not pursued; nats_sidecar's
+      integration rejects these at subscribe time instead (see above).
 - [ ] PSTParallel (Algorithm 7) - a much bigger, separate architectural lift, deliberately not
       scoped yet.
 - [ ] Space merging / zero-counter leaf reclamation (deferred, see design notes above) - not a
