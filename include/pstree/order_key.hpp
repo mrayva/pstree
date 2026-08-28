@@ -192,7 +192,7 @@ private:
 // i.e. `>` at the largest representable value, or `<` at the smallest, matches nothing.
 inline std::optional<ElementKey> nextElementKey(const KeyShape& shape, ElementKey key) {
     for (std::size_t i = key.size(); i-- > 0;) {
-        if (key[i] + 1 < shape.radix[i]) {
+        if (static_cast<std::uint32_t>(key[i]) + 1 < shape.radix[i]) {
             key[i] += 1;
             return key;
         }
