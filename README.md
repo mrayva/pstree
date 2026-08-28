@@ -117,6 +117,17 @@ against the paper's own worked examples rather than assumed. See the top-of-file
 - **`list_valued` attributes are not supported** (nats_sidecar's `string_list`/`integer_list`) -
   the paper's model has no analog (an event attribute is always a single value, never a list) -
   real follow-up work for the `nats_sidecar` integration phase, not assumed solved.
+- **`kIsNull`/`kIsNotNull` are not part of the paper's model at all** - added for a real caller's
+  need (nats_sidecar's own "attribute is/is not present" predicates), evaluated on ABSENCE rather
+  than a value comparison. `kIsNull` can never be an access predicate (rejected clearly at insert
+  time if it's the only/best option) - there is structurally no way to index "this dimension was
+  absent", since `MatchEvent` only ever consults a dimension's tree for events that DO have it.
+  `kIsNotNull` CAN be indexed (falls back to "matches every leaf", which is exactly correct here,
+  not just safe - see the code comment). A real, subtle bug found by extending the tests for this:
+  a subscription's dimension signature must EXCLUDE any dimension used only via `kIsNull` - the
+  signature's whole pruning contract assumes "this subscription needs dimension D" means "D must
+  be present", which is backwards for `kIsNull` and would incorrectly prune out the exact events
+  it's meant to match.
 
 ## Building
 

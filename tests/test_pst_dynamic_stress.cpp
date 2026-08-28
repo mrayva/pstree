@@ -71,7 +71,7 @@ pstree::Value randomValue(const Dim& dim, std::mt19937& rng) {
 }
 
 pstree::CmpOp randomOp(std::mt19937& rng) {
-    std::uniform_int_distribution<int> d(0, 8);
+    std::uniform_int_distribution<int> d(0, 10); // includes kIsNull(9)/kIsNotNull(10)
     return static_cast<pstree::CmpOp>(d(rng));
 }
 
@@ -88,6 +88,9 @@ pstree::SubPredicate randomPredicate(const Dim& dim, std::mt19937& rng) {
         std::vector<pstree::Value> vals;
         for (int i = 0; i < countDist(rng); ++i) vals.push_back(randomValue(dim, rng));
         return {dim.name, op, vals};
+    }
+    if (op == pstree::CmpOp::kIsNull || op == pstree::CmpOp::kIsNotNull) {
+        return {dim.name, op, {}};
     }
     return {dim.name, op, {randomValue(dim, rng)}};
 }
@@ -139,7 +142,16 @@ void test_random_insert_delete_matches_brute_force() {
         bool doInsert = active.empty() || (rng() % 100) < 70;
         if (doInsert) {
             auto sub = randomSubscription(nextId++, dims, rng);
-            pstd.insertSubscription(sub);
+            // A subscription whose every predicate happens to be kIsNull (possible now
+            // that randomOp can generate one) is legitimately rejected by
+            // insertSubscription - see pst_dynamic.hpp's own comment. Skip it here rather
+            // than treat it as a test failure, the same way a real caller validating its
+            // own subscriptions would.
+            try {
+                pstd.insertSubscription(sub);
+            } catch (const std::invalid_argument&) {
+                continue;
+            }
             active.push_back(sub);
         } else {
             std::uniform_int_distribution<std::size_t> pick(0, active.size() - 1);

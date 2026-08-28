@@ -111,9 +111,11 @@ inline int opRank(CmpOp op) {
         case CmpOp::kGt:
         case CmpOp::kGe: return 3;
         case CmpOp::kNotElemOf: return 4;
-        case CmpOp::kNe: return 5;
+        case CmpOp::kNe:
+        case CmpOp::kIsNotNull: return 5; // same "matches everything" fallback tier as kNe
+        case CmpOp::kIsNull: return 6;    // worse than kNe: cannot be indexed AT ALL (see applyToTree)
     }
-    return 5;
+    return 6;
 }
 
 // Smaller = more selective (narrower). Only meaningful within the same rank tier (Section
@@ -149,6 +151,27 @@ inline std::size_t shrinkThreshold(std::size_t dimSigLen) {
     return growThreshold(dimSigLen) / 4;
 }
 
+// Dimensions to hash into a subscription's dimension signature - every predicate's
+// dimension EXCEPT kIsNull's. The signature's whole pruning contract (Algorithm 5, line 8:
+// skip a group unless its signature's dimensions are all present in the event) assumes
+// "this subscription needs dimension D" means "D must be PRESENT in the event to possibly
+// match" - true for every real operator, but backwards for kIsNull, which is satisfied
+// exactly when its dimension is ABSENT. Including a kIsNull dimension in the signature
+// would make the pruning incorrectly reject the exact events kIsNull is meant to match
+// (found by test_pst_dynamic.cpp/test_pst_dynamic_stress.cpp, not anticipated when kIsNull
+// was first added). Omitting it only makes the signature LESS specific (more candidates
+// pass the group-level prune), which is always safe - the final matchSubscription() call
+// still re-verifies kIsNull correctly regardless. kIsNotNull is NOT excluded: it genuinely
+// does require its dimension present, matching the signature's normal assumption.
+inline std::vector<std::string> dimSigDimensions(const Subscription& sub) {
+    std::vector<std::string> dims;
+    dims.reserve(sub.predicates.size());
+    for (auto& p : sub.predicates) {
+        if (p.op != CmpOp::kIsNull) dims.push_back(p.attr);
+    }
+    return dims;
+}
+
 } // namespace detail
 
 // Deterministic access-predicate selection (Section 2.3's static heuristic - see
@@ -166,6 +189,20 @@ inline std::size_t selectAccPredIndex(const Subscription& sub) {
         bool better = rankI < rankBest ||
             (rankI == rankBest && detail::widthTieBreak(sub.predicates[i]) < detail::widthTieBreak(sub.predicates[best]));
         if (better) best = i;
+    }
+    // kIsNull ranks worst specifically so it's only ever chosen when nothing else is
+    // available (see opRank) - and when that happens, the subscription genuinely can't be
+    // indexed at all: "X is null" only matches events where X is absent, but MatchEvent
+    // never consults X's own dimension tree for such events in the first place (there's no
+    // pair to route through). Caught here, at selection time, with a clear message - not
+    // silently left to produce a subscription that can never match anything.
+    if (sub.predicates[best].op == CmpOp::kIsNull) {
+        throw std::invalid_argument(
+            "pstree: subscription " + std::to_string(sub.id) +
+            " cannot be indexed - its best available access predicate is 'is null' on '" +
+            sub.predicates[best].attr +
+            "', which has no representable PS-Tree range (add at least one other, "
+            "indexable predicate to this subscription)");
     }
     return best;
 }
@@ -199,9 +236,7 @@ public:
 
         std::vector<LeafNode*> leafNodes = applyToTree(dim, accPred, /*insert=*/true);
 
-        std::vector<std::string> subDims;
-        subDims.reserve(sub.predicates.size());
-        for (auto& p : sub.predicates) subDims.push_back(p.attr);
+        std::vector<std::string> subDims = detail::dimSigDimensions(sub);
 
         for (LeafNode* leaf : leafNodes) {
             LeafGroupState& state = groupStateFor(leaf);
@@ -263,9 +298,7 @@ public:
 
         std::vector<LeafNode*> leafNodes = applyToTree(dim, accPred, /*insert=*/false);
 
-        std::vector<std::string> subDims;
-        subDims.reserve(sub.predicates.size());
-        for (auto& p : sub.predicates) subDims.push_back(p.attr);
+        std::vector<std::string> subDims = detail::dimSigDimensions(sub);
 
         for (LeafNode* leaf : leafNodes) {
             if (leaf->userData == nullptr) {
@@ -383,8 +416,25 @@ private:
             }
             case CmpOp::kNe:
             case CmpOp::kNotElemOf:
+            case CmpOp::kIsNotNull:
+                // "X is not null" as an access predicate means exactly "X is present" -
+                // which is precisely the condition under which MatchEvent ever consults
+                // this dimension's tree in the first place (its own per-pair loop only
+                // visits dimensions the event actually has). So "matches every leaf" is
+                // not just a safe fallback here, it's the CORRECT indexing: every event
+                // that reaches this tree already satisfies kIsNotNull by construction.
                 lowLevel.push_back({Op::kGe, detail::minKeyFor(dim.schema), {}});
                 break;
+            case CmpOp::kIsNull:
+                // The opposite direction has no indexable meaning at all: "X is null"
+                // only matches events where X is ABSENT, but MatchEvent structurally never
+                // consults X's own tree for such events (there's no pair to route through).
+                // Rejected by insertSubscription/deleteSubscription before this function is
+                // ever reached when kIsNull would be the chosen access predicate (see their
+                // own doc comments) - reaching this case means that guard was bypassed.
+                throw std::logic_error(
+                    "pstree: kIsNull cannot be used as an access predicate - "
+                    "this should have been rejected before reaching applyToTree");
         }
         std::vector<LeafNode*> all;
         for (auto& p : lowLevel) {
@@ -406,10 +456,7 @@ private:
         state.groups.clear();
         for (auto id : allSubs) {
             const Subscription& sub = subscriptions_.at(id);
-            std::vector<std::string> dims;
-            dims.reserve(sub.predicates.size());
-            for (auto& p : sub.predicates) dims.push_back(p.attr);
-            DimSig sig = calculateDimSig(dims, state.dimSigLen);
+            DimSig sig = calculateDimSig(detail::dimSigDimensions(sub), state.dimSigLen);
             state.groups[sig].push_back(id);
         }
     }

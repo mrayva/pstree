@@ -97,6 +97,36 @@ void test_missing_attribute_fails_subscription() {
     require(pstree::matchSubscription(extraEvent, sub), "extra unrelated event attributes should not block a match");
 }
 
+// kIsNull/kIsNotNull test presence itself, not a value - distinct from the "absent
+// attribute always fails" rule above, which is exactly what these two are designed to
+// override for their own attribute.
+void test_is_null_and_is_not_null() {
+    pstree::Subscription sub;
+    sub.id = 1;
+    sub.predicates.push_back(pred("discount", pstree::CmpOp::kIsNull, {}));
+
+    require(pstree::matchSubscription({}, sub), "discount absent should satisfy 'discount is null'");
+    pstree::Event withDiscount = {{"discount", pstree::Value(std::int64_t{5})}};
+    require(!pstree::matchSubscription(withDiscount, sub), "discount present should fail 'discount is null'");
+
+    pstree::Subscription notNullSub;
+    notNullSub.id = 2;
+    notNullSub.predicates.push_back(pred("discount", pstree::CmpOp::kIsNotNull, {}));
+    require(pstree::matchSubscription(withDiscount, notNullSub), "discount present should satisfy 'discount is not null'");
+    require(!pstree::matchSubscription({}, notNullSub), "discount absent should fail 'discount is not null'");
+
+    // Combined with a normal predicate: "price>100 and discount is null" - the common real
+    // pattern (an is-null check alongside at least one indexable predicate).
+    pstree::Subscription combined;
+    combined.id = 3;
+    combined.predicates.push_back(pred("price", pstree::CmpOp::kGt, {std::int64_t{100}}));
+    combined.predicates.push_back(pred("discount", pstree::CmpOp::kIsNull, {}));
+    pstree::Event highPriceNoDiscount = {{"price", pstree::Value(std::int64_t{150})}};
+    require(pstree::matchSubscription(highPriceNoDiscount, combined), "price>100 and discount absent should match");
+    pstree::Event highPriceWithDiscount = {{"price", pstree::Value(std::int64_t{150})}, {"discount", pstree::Value(std::int64_t{5})}};
+    require(!pstree::matchSubscription(highPriceWithDiscount, combined), "price>100 but discount present should not match");
+}
+
 } // namespace
 
 int main() {
@@ -106,6 +136,7 @@ int main() {
     test_bool_and_double();
     test_type_mismatch_throws();
     test_missing_attribute_fails_subscription();
+    test_is_null_and_is_not_null();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";

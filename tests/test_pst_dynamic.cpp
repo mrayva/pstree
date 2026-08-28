@@ -202,6 +202,64 @@ void test_ne_only_access_predicate_fallback() {
     require(pstd.matchEvent({{"status", pstree::Value(std::int64_t{1})}}).empty(), "after delete, nothing should match");
 }
 
+// kIsNotNull as the (only, forced) access predicate: unlike kNe, this is actually the
+// CORRECT indexing, not just a safe fallback - see pst_dynamic.hpp's own comment.
+void test_is_not_null_only_access_predicate() {
+    std::vector<pstree::AttrSchema> schema = {{"discount", pstree::ValueType::kInteger, 0}};
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{30, {pstree::SubPredicate{"discount", pstree::CmpOp::kIsNotNull, {}}}};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({{"discount", pstree::Value(std::int64_t{0})}}).size() == 1, "discount present (any value) should match");
+    require(pstd.matchEvent({{"discount", pstree::Value(std::int64_t{-500})}}).size() == 1, "discount present (negative) should still match");
+    require(pstd.matchEvent({}).empty(), "discount absent should not match 'is not null'");
+
+    pstd.deleteSubscription(30);
+    require(pstd.matchEvent({{"discount", pstree::Value(std::int64_t{0})}}).empty(), "after delete, nothing should match");
+}
+
+// kIsNull cannot be an access predicate at all (see pst_dynamic.hpp's own comment on
+// selectAccPredIndex) - a subscription whose ONLY predicate is "is null" must be rejected
+// clearly at insert time, not silently accepted as unmatchable.
+void test_is_null_only_predicate_rejected() {
+    std::vector<pstree::AttrSchema> schema = {{"discount", pstree::ValueType::kInteger, 0}};
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{40, {pstree::SubPredicate{"discount", pstree::CmpOp::kIsNull, {}}}};
+    bool threw = false;
+    try {
+        pstd.insertSubscription(sub);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "a subscription whose only predicate is 'is null' should be rejected at insert time");
+}
+
+// kIsNull alongside a normal, indexable predicate: the normal predicate becomes the access
+// predicate (kIsNull always ranks worst), and kIsNull is evaluated correctly during the
+// final per-subscription check - the realistic pattern ("price>100 and discount is null").
+void test_is_null_with_indexable_predicate() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"price", pstree::ValueType::kInteger, 0},
+        {"discount", pstree::ValueType::kInteger, 0},
+    };
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{50, {
+        pstree::SubPredicate{"price", pstree::CmpOp::kGt, {std::int64_t{100}}},
+        pstree::SubPredicate{"discount", pstree::CmpOp::kIsNull, {}},
+    }};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({{"price", pstree::Value(std::int64_t{150})}}).size() == 1,
+            "price>100 with discount absent entirely should match");
+    require(pstd.matchEvent({{"price", pstree::Value(std::int64_t{150})}, {"discount", pstree::Value(std::int64_t{5})}}).empty(),
+            "price>100 but discount present should not match");
+    require(pstd.matchEvent({{"price", pstree::Value(std::int64_t{50})}}).empty(),
+            "price<=100 should not match regardless of discount");
+
+    pstd.deleteSubscription(50);
+    require(pstd.matchEvent({{"price", pstree::Value(std::int64_t{150})}}).empty(), "after delete, nothing should match");
+}
+
 // Forces at least one group-reorganization (growing DimSigLen) by inserting more
 // subscriptions on the same leaf than the initial threshold allows, then confirms every
 // one of them - old and new - still matches/doesn't-match correctly, proving
@@ -251,6 +309,9 @@ int main() {
     test_delete_subscription();
     test_elem_of_access_predicate();
     test_ne_only_access_predicate_fallback();
+    test_is_not_null_only_access_predicate();
+    test_is_null_only_predicate_rejected();
+    test_is_null_with_indexable_predicate();
     test_reorganize_groups_preserves_correctness();
 
     if (g_failures > 0) {

@@ -26,6 +26,17 @@ namespace pstree {
 // inclusive) - named differently here to avoid colliding with the set-membership meaning
 // most readers expect from "in"; kElemOf/kNotElemOf are the paper's actual set operators
 // (also called ∈/∉ in the paper), each matching against a literal LIST of values.
+//
+// kIsNull/kIsNotNull are NOT part of the paper's own model at all - the paper has no
+// concept of an attribute being explicitly "absent but tested for" (Section 2.2's semantics
+// already treat a missing attribute as an automatic non-match for whatever predicate
+// references it, full stop). They exist here because a real caller (nats_sidecar) needs to
+// test presence/absence itself as a first-class predicate ("discount is null"), which
+// `vals`-based value comparison can't express - see matchSubscription()'s own special-casing
+// for them below, and pst_dynamic.hpp's SelectAccPred/applyToTree comments for why kIsNull
+// specifically can never be used as an access predicate (no tree can index "this dimension
+// was absent", since MatchEvent only ever consults a dimension's tree for events that DO
+// have it).
 enum class CmpOp {
     kLt,
     kLe,
@@ -36,6 +47,8 @@ enum class CmpOp {
     kBetween,   // paper's "in": vals[0] <= x <= vals[1]
     kElemOf,    // paper's "∈": x equals any of vals
     kNotElemOf, // paper's "∉": x equals none of vals
+    kIsNull,    // vals empty: true iff the attribute is ABSENT from the event
+    kIsNotNull, // vals empty: true iff the attribute is PRESENT in the event (any value)
 };
 
 // A predicate's value type - every attribute in a schema has exactly one of these types,
@@ -73,6 +86,11 @@ inline const Value* findAttr(const Event& event, std::string_view attr) {
 // same attribute), not a matching outcome, so it's surfaced loudly rather than silently
 // answered via std::variant's own index-based ordering (which would produce a
 // deterministic but semantically meaningless true/false for mismatched types).
+//
+// Never actually called for kIsNull/kIsNotNull - matchSubscription() below intercepts both
+// before reaching here, since they're evaluated on ABSENCE, not on a concrete value at all
+// (there's no `val` to hand this function when the attribute is absent in the first place).
+// The cases exist only so this switch stays exhaustive; reaching them is a caller bug.
 inline bool matchValue(const Value& val, const SubPredicate& pred) {
     auto checkSameType = [&](const Value& other) {
         if (val.index() != other.index()) {
@@ -114,6 +132,9 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
                 if (val == v) return false;
             }
             return true;
+        case CmpOp::kIsNull:
+        case CmpOp::kIsNotNull:
+            throw std::logic_error("pstree: kIsNull/kIsNotNull must be intercepted by matchSubscription, never reach matchValue");
     }
     return false;
 }
@@ -128,6 +149,17 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
 inline bool matchSubscription(const Event& event, const Subscription& sub) {
     for (const auto& pred : sub.predicates) {
         const Value* val = findAttr(event, pred.attr);
+        // kIsNull/kIsNotNull test presence itself, not a value comparison - intercepted
+        // here, before the "absent attribute always fails" rule below would otherwise
+        // incorrectly reject kIsNull for exactly the case it's meant to accept.
+        if (pred.op == CmpOp::kIsNull) {
+            if (val != nullptr) return false;
+            continue;
+        }
+        if (pred.op == CmpOp::kIsNotNull) {
+            if (val == nullptr) return false;
+            continue;
+        }
         if (val == nullptr) return false;
         if (!matchValue(*val, pred)) return false;
     }
