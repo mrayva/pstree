@@ -1,92 +1,114 @@
 #pragma once
 
-// PS-Tree (Predicate Space Tree) - paper Section 4, Algorithms 1-3 (pages 8-15).
+// PS-Tree (Predicate Space Tree) - originally a direct transcription of the paper's own
+// Algorithms 1-3 (leaf-chain boundary partitioning: a range predicate materializes coverage
+// on every leaf between its boundary and the domain's edge). That approach is SUPERSEDED here
+// for range operators (kGe/kGt/kLe/kLt/kIn) - not a transcription of the paper anymore for
+// those - because it has a real, measured scaling problem: inserting a wide, unbounded range
+// predicate ("price >= X" with X near the low end of the domain) is O(number of leaves
+// currently covered), which grows with how many OTHER predicates have already been inserted
+// on the same dimension (more predicates -> a more finely-partitioned, longer leaf chain).
+// Measured via mrayva/nats_sidecar's own matching-engine benchmark at K=10,000 synthetic
+// subscriptions (30% of which are a bare "price > X" with no other predicate, forcing it to
+// be the access predicate): insert throughput fell to ~1.4% of a competing engine's, search
+// throughput to ~15% - both degrading far worse than linearly with K.
 //
-// A single-dimension index: predicates over one attribute are inserted as covering a
-// contiguous range of the value domain ("predicate space"); MatchPair(value) finds which
-// predicate space a value falls into in O(depth) time.
+// REPLACEMENT DESIGN: canonical ancestor markers on the existing digit-trie (the classical
+// "canonical decomposition" technique for stabbing queries - the multiway/radix
+// generalization of a segment tree - applied to the same fixed-length ElementKey digit
+// sequence order_key.hpp already produces, most-significant digit first).
 //
-// This is a direct transcription of Algorithms 1-3 from the PDF, generalized to work over
-// any KeyShape-described element decomposition (see order_key.hpp) instead of one fixed
-// value type - Section 4.5 explicitly states this isolation ("PS-Tree... isolates the
-// specific value types and operators from the upper matching layer") is a design goal, so
-// making the tree generic over the element codec follows the paper's own intent.
+//   - Equality (kEq) moves to a plain hashmap (ElementKey -> LeafNode*) - it never had the
+//     scaling problem (a point predicate is already O(1)) and doesn't need any trie walk.
+//   - Range operators attach to O(depth) ANCESTOR nodes instead of O(leaves-covered) leaves.
+//     Each InnerNode gains `geMarkers`/`leMarkers` (sorted threshold -> bucket maps - since the
+//     encoding is most-significant-digit-first, a digit strictly exceeding a threshold at an
+//     earlier level guarantees `>=` regardless of deeper digits, which is exactly why an
+//     intermediate-level marker is always a pure prefix/suffix range, never an arbitrary
+//     interval) plus a small `boundedMarkers` vector for the one genuinely-bounded case (kIn's
+//     single "gap between lo's and hi's subtrees" marker - see insertBetween()).
+//   - InsertPredicate(">=V"): walk V's digit path from the root (creating InnerNodes as
+//     needed). At every level except the last: if V[level]+1 < radix[level], get-or-create a
+//     geMarkers bucket at threshold V[level]+1 on the current node (marks every sibling
+//     strictly greater than V[level] as unconditionally covered) and descend into child
+//     V[level] to keep refining the "still exactly matches V" case. At the last level:
+//     get-or-create a geMarkers bucket at threshold V[depth-1] itself (inclusive - no deeper
+//     level to refine further). "<=V" is the exact mirror (leMarkers, guarded by
+//     `V[level] > 0` before computing threshold V[level]-1 - `threshold` is uint16_t, and
+//     omitting this guard when V[level]==0 would underflow to 65535 and silently corrupt
+//     leMarkers). kGt/kLt keep the existing next/prevElementKey normalization to an adjacent
+//     key, then kGe/kLe, unchanged.
+//   - InsertPredicate(BETWEEN[lo,hi], kIn): lo==hi is a REQUIRED base case (not an
+//     optimization) routed to the same equality hashmap as kEq - if lo==hi there is no level
+//     where their digits diverge, so "the first level where they differ" is undefined for the
+//     general algorithm below. Otherwise: find `lcaLevel` (first level where lo/hi digits
+//     diverge); levels before it just descend together (no marker - the whole range agrees on
+//     that shared prefix). If lcaLevel is the LAST level (depth-1), there is no deeper level to
+//     refine into at all, so the whole range collapses to ONE inclusive boundedMarkers entry
+//     [lo[lcaLevel], hi[lcaLevel]] at the lca node itself (a distinct, necessary case from the
+//     one below - descending into "child loD" here would create a node with nothing correct to
+//     attach to it, since geFrom/leFrom would immediately be called with startLevel==depth and
+//     do nothing). Otherwise (lcaLevel < depth-1): one boundedMarkers entry
+//     [lo[lcaLevel]+1, hi[lcaLevel]-1] on the shared node (if non-empty) covers everything
+//     strictly between lo's and hi's subtrees as a whole; lo's own branch (child lo[lcaLevel])
+//     gets the same GE-style decomposition rooted one level deeper (bounded above by hi
+//     automatically, since it's entirely inside the lca's lo-side child); hi's branch
+//     (child hi[lcaLevel]) gets the LE-style decomposition, symmetrically.
+//   - MatchPoint(val): hashmap lookup for exact equality, plus a walk of val's digit path
+//     collecting every geMarkers entry with threshold <= val[level] and every leMarkers entry
+//     with threshold >= val[level] (both a std::map prefix/suffix scan via upper_bound/
+//     lower_bound, not a linear scan) and any boundedMarkers match (linear scan - see the
+//     residual-debt note below) at every node visited; stops descending once p[val[level]]
+//     doesn't exist (nothing deeper could apply on this exact path - no node was ever created
+//     past a point unless some insertion's own path needed it, and this query isn't following
+//     any such insertion's path past this point).
+//   - DeletePredicate re-runs the identical deterministic walk to find the same buckets and
+//     decrement predCounter, throwing (not silently underflowing an unsigned counter) if the
+//     expected bucket or inner-node path doesn't exist - deleting a predicate that was never
+//     inserted, or double-deleting one. Buckets are DELIBERATELY NOT freed when predCounter
+//     reaches zero (unlike an earlier draft of this design, which tried to - see the note on
+//     destroy() below for why that's unsafe): PSTDynamic's own per-bucket group state
+//     (LeafNode::userData) needs to still be readable/mutable by the CALLER after
+//     insertPredicate/deletePredicate returns, and a caller only reads/updates a bucket's
+//     userData strictly after seeing it in the returned list - freeing a zero-counter bucket
+//     eagerly, inside this call, would leave that access reading freed memory. A zero-counter
+//     "zombie" bucket costs a small, bounded amount of memory (mirroring the ORIGINAL leaf-
+//     chain design's own deferred "MergeSpaces" stance - see git history - just for a different
+//     underlying reason) and is otherwise harmless: MatchEvent finds it via matchPoint() same as
+//     any other bucket, and an empty/all-decremented userData structure naturally contributes
+//     nothing to a match.
 //
-// OPERATORS: the paper's own pseudocode only ever gives >= (kGe), = (kEq), <= (kLe), and
-// in/BETWEEN (kIn, both endpoints inclusive) - InsertPredicate (Algorithm 1, lines 2-10)
-// shows exactly these three ranges plus prose "other operators are processed in a similar
-// way"; DeletePredicate (Algorithm 3, lines 1-17) independently confirms the same four,
-// never showing > or < explicitly either. Deriving a correct standalone tree-wiring for
-// strict > / < turned out to need real care (an earlier draft of this file got it wrong -
-// see git history) and isn't actually necessary: since every value type here is encoded as
-// a discrete, totally-ordered ElementKey with a declared per-level radix (order_key.hpp),
-// ">V" and "<V" have an exact equivalent as ">=next(V)" and "<=prev(V)" via ordinary
-// mixed-radix increment/decrement (order_key.hpp's nextElementKey/prevElementKey) - kGt/kLt
-// below are handled by that normalization, reusing kGe/kLe's already-verified wiring rather
-// than adding new, separately-derived tree logic for them.
+// Complexity after this redesign: range insert/delete is O(depth) - a small per-attribute-type
+// constant (16 for int64/double, <=128 for string, 1 for bool - see order_key.hpp), independent
+// of how many other predicates exist on that dimension. Point query is
+// O(depth * log(markers per node) + result-size) instead of exactly O(1), but no longer grows
+// with the number of previously-inserted predicates on the wide-range side. Equality stays O(1).
 //
-// Discrepancies between the literally-printed pseudocode and what must be correct, found
-// by cross-checking against the paper's own worked examples and prose, and by a randomized
-// property test (not assumed - see the comments at each site):
-//   1. MatchPair (Algorithm 2, line 8): the paper prints `GetLNode(currNode, pstree.root)`,
-//      but the surrounding prose says "GetRNode and GetLNode are invoked" (both used
-//      together) and Algorithm 1's own Partition uses the identical two-step pattern
-//      `iRNode <- GetRNode(path); iLNode <- GetLNode(iRNode, root)`. Also, if `currNode`'s
-//      own subtree has no descendants yet, GetLNode(currNode,...) cannot terminate (its
-//      loop requires *some* non-null p[] entry to descend through). Implemented here as
-//      `GetLNode(iRNode, root)`, matching Algorithm 1's own pattern.
-//   2. DeletePredicate (Algorithm 3, line 19): the paper prints `if lNode.predCounter = 0`,
-//      but `lNode` is never defined anywhere else in the function - `startNode`, whose
-//      predCounter was just decremented on the immediately preceding line, is clearly the
-//      intended variable. Implemented here as `startNode.predCounter == 0`.
-//   3. Neither PartitionLeafNodeLeft nor PartitionLeafNodeEqual's literal pseudocode
-//      updates any node OTHER than `currNode` itself when a leaf gets split - but
-//      GetLNode's own search (used by insertions arriving at OTHER, unrelated values) can
-//      permanently wire some other, already-existing node's `.l` link directly to a leaf
-//      that a LATER insertion then splits - leaving that other node's `.l` stale (pointing
-//      at a piece that's since been narrowed down to no longer include everything the
-//      other node needs). Caught two ways: first by hand-tracing Section 4.4's own worked
-//      example (a `.e` self-alias going stale after a `.l` redirect - see below), then by a
-//      randomized property test finding a second, more general instance (a WHOLLY
-//      UNRELATED node's `.l`, wired up by ITS OWN earlier insertion's search, going stale
-//      after a completely different later insertion's split). Both are the same underlying
-//      problem: `.l` links can be shared across nodes via search, and nothing in the
-//      literal pseudocode invalidates a stale one. Fixed generally, not case-by-case, via
-//      `l_refs` - each LeafNode tracks which InnerNodes currently point to it via `.l`
-//      (`setLeafL`/`redirectLeafLRefs` below) - so every split can correctly redirect EVERY
-//      such reference to the new "rightward" piece, not just the one node the immediate
-//      caller happens to already know about. A node's `.e` self-aliasing with its own `.l`
-//      (only possible for a node created via the kLe wiring, where they start equal) is
-//      handled as part of the same redirect, since it's discovered via the identical
-//      back-reference list.
+// RESIDUAL DEBT, not silently forgotten: `boundedMarkers`' linear scan (both at insert/delete,
+// finding-or-creating a matching (lo,hi) pair, and at query time, checking which contain a
+// point) is NOT asymptotically optimized - if many kIn/BETWEEN predicates ever shared the same
+// lca node, that node's scan would reintroduce an O(K)-shaped cost for that one operator
+// specifically. This is out of scope for the fix here because kIn/BETWEEN is (a) not the
+// operator the benchmark above found expensive (bare "price > X" access predicates are kGe, not
+// kIn) and (b) not reachable at all from mrayva/nats_sidecar's own dialect translation today
+// (confirmed: no kBetween references in that repo's pstree_dialect.{hpp,cpp}). If kIn ever
+// becomes reachable or performance-critical, this is the place that would need its own
+// interval-augmented structure (the same canonical-decomposition idea, one level deeper).
 //
-// Deferred, not a correctness gap: the paper describes space MERGING (combining adjacent
-// leaves that end up with equal predicate counters after a deletion) only as prose with a
-// worked example (Section 4.4) - it gives no pseudocode for `MergeSpaces` at all. Skipping
-// the merge does NOT break MatchPair's correctness (two adjacent leaves with equal
-// counters still each correctly answer queries into their own sub-range), it only forgoes
-// a memory-compaction opportunity - so this first implementation performs the
-// well-specified part (decrementing counters, and leaving a leaf's counter at zero once
-// nothing covers it) and leaves both actual merging AND freeing zero-counter leaves as
-// follow-up work (freeing one safely needs the same inner-node rewiring merging would).
-//
-// 4. Phase 2 (PSTDynamic) needs to attach its own per-leaf metadata (which subscriptions
-//    are grouped here, by dimension signature) - discovered, while building it, that a
-//    leaf's OWN IDENTITY (the LeafNode object a subscription got attached to at insert
-//    time) is not stable: a LATER, wholly unrelated subscription's insertion can split that
-//    same leaf into two, exactly like predCounter already needs to be (and is) copied to
-//    the new piece - but nothing propagated a subscription-tracking side-table keyed by
-//    LeafNode* the same way. LeafNode::userData plus the clone/destroy hooks below exist
-//    specifically to fix this class of bug generically, without PS-Tree needing to know
-//    anything about subscriptions or dimension signatures itself: copyLeafNode() clones
-//    userData exactly when it copies predCounter, so whatever the upper layer attaches
-//    automatically follows every split the same way the counter does.
+// `p[]` (child links) is a std::map<uint16_t,InnerNode*> uniformly for now (a dense
+// vector-per-radix hybrid for the small-radix numeric types, keeping the sparse map only for
+// the string codec's radix-257 nodes, is real follow-up work - not required for correctness or
+// for fixing the measured problem, since even a plain sorted map is already O(log(children at
+// this node)) instead of the OLD design's O(leaves) blowup).
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <optional>
 #include <stdexcept>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -94,9 +116,10 @@
 
 namespace pstree {
 
-// kGe/kEq/kLe/kIn are the paper's own pseudocode operators (see file-level comment).
-// kGt/kLt are supported by normalizing to kGe/kLe at an adjacent key, not via separate
-// tree-wiring - see insertPredicate/deletePredicate/matches-nothing handling below.
+// kGe/kEq/kLe/kIn are the paper's own pseudocode operators. kGt/kLt are supported by
+// normalizing to kGe/kLe at an adjacent key (order_key.hpp's nextElementKey/prevElementKey),
+// exactly as before this redesign - that normalization was never part of the scaling problem
+// and needed no changes.
 enum class Op {
     kGe, // >=
     kGt, // >
@@ -106,62 +129,56 @@ enum class Op {
     kIn, // BETWEEN [lo, hi], both endpoints inclusive
 };
 
-struct InnerNode;
-
+// A predicate-space "bucket": how many currently-inserted low-level Predicates cover this
+// exact space, plus an opaque slot for an upper layer's own per-bucket data (PSTDynamic
+// attaches its dimension-signature group state here - see pst_dynamic.hpp). Not interpreted
+// by PSTree itself. Every bucket is owned by exactly ONE container slot (the equality hashmap,
+// or one specific InnerNode's geMarkers/leMarkers/boundedMarkers entry) - unlike the original
+// leaf-chain design, buckets are never split or aliased across multiple owners, so there is no
+// "which node currently points at this" back-reference bookkeeping needed anymore.
 struct LeafNode {
-    LeafNode* next = nullptr; // next leaf in increasing predicate-space order
     std::uint64_t predCounter = 0;
-    // Every InnerNode whose CURRENT `.leaf_l` points to this leaf - maintained by
-    // setLeafL()/redirectLeafLRefs() below, never touched directly. This is what lets a
-    // split correctly find and fix up every stale `.l` reference, not just the one node
-    // the immediate caller already knows about - see file-level comment #3.
-    std::vector<InnerNode*> l_refs;
-    // Opaque slot for an upper layer's own per-leaf data (see file-level comment #4) - NOT
-    // interpreted by PS-Tree itself. Owned according to whatever clone/destroy hooks the
-    // PSTree instance was constructed with (both default to no-ops, so plain Phase 1 usage
-    // with no attached data is completely unaffected: userData just stays null forever).
     void* userData = nullptr;
 };
 
 struct InnerNode {
-    // Paper Fig. 2 overloads inner-node l/e/g as pointers to LEAF nodes (not other inner
-    // nodes) - modeled faithfully here via separate leaf-typed fields.
-    LeafNode* leaf_l = nullptr; // leaf whose predicate space is strictly less than this node's value
-    LeafNode* leaf_e = nullptr; // leaf whose predicate space equals this node's value
-    LeafNode* leaf_g = nullptr; // leaf whose predicate space is strictly greater than this node's value
-    std::vector<InnerNode*> p;  // child inner nodes, indexed by this level's element value
+    std::map<std::uint16_t, InnerNode*> p;                                        // child nodes, by digit
+    std::map<std::uint16_t, LeafNode*> geMarkers;                                 // threshold -> bucket: "digit >= threshold" covers
+    std::map<std::uint16_t, LeafNode*> leMarkers;                                 // threshold -> bucket: "digit <= threshold" covers
+    std::vector<std::tuple<std::uint16_t, std::uint16_t, LeafNode*>> boundedMarkers; // {lo, hi, bucket}: "lo <= digit <= hi" covers
 };
 
 // A predicate's single insertion/deletion unit: one attribute (handled by the caller, one
 // PSTree per dimension), one operator, one or two values (kIn uses both vals0/vals1 as
-// [lo, hi]; every other op uses vals0 only).
+// [lo, hi]; every other op uses vals0 only). Unchanged by this redesign.
 struct Predicate {
     Op op;
     ElementKey vals0;
     ElementKey vals1; // only meaningful for Op::kIn
 };
 
+namespace detail {
+struct ElementKeyHash {
+    std::size_t operator()(const ElementKey& k) const noexcept {
+        std::size_t h = k.size();
+        for (auto e : k) {
+            h ^= std::hash<std::uint16_t>{}(e) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+} // namespace detail
+
 class PSTree {
 public:
-    // See file-level comment #4: `cloneUserData` is invoked by copyLeafNode() whenever a
-    // leaf is split, to produce the new leaf's own independent copy of the source's
-    // userData (called with nullptr if the source has none, expected to return nullptr in
-    // that case too - not skipped, so a caller relying on a non-null default can still get
-    // one). `destroyUserData` is invoked when a leaf is freed. Both default to no-ops; a
-    // PSTree constructed without them behaves exactly as if userData didn't exist at all.
-    using CloneUserData = std::function<void*(void*)>;
+    // Invoked when a bucket is freed (tree destruction only - see the file-level comment on
+    // why buckets are never freed early, on decrement). Defaults to a no-op; a PSTree
+    // constructed without one behaves exactly as if userData didn't exist at all.
     using DestroyUserData = std::function<void(void*)>;
 
-    explicit PSTree(KeyShape shape, CloneUserData cloneUserData = {}, DestroyUserData destroyUserData = {})
-        : shape_(std::move(shape)), cloneUserData_(std::move(cloneUserData)), destroyUserData_(std::move(destroyUserData)) {
+    explicit PSTree(KeyShape shape, DestroyUserData destroyUserData = {})
+        : shape_(std::move(shape)), destroyUserData_(std::move(destroyUserData)) {
         root_ = new InnerNode();
-        root_->p.assign(levelRadix(0), nullptr);
-        // Root's own boundary leaves: g links to the first (leftmost) predicate space,
-        // l links to the last (rightmost) - "For the root node, a special consideration
-        // is that g links to the first leaf node, and l links to the last leaf node."
-        auto* first = new LeafNode();
-        root_->leaf_g = first;
-        setLeafL(root_, first);
     }
 
     ~PSTree() { destroy(); }
@@ -169,147 +186,84 @@ public:
     PSTree(const PSTree&) = delete;
     PSTree& operator=(const PSTree&) = delete;
 
-    // Algorithm 1, InsertPredicate. Returns every leaf whose predicate space is now
-    // covered by `pred` (predCounter already incremented on each). kGt/kLt normalize to
-    // kGe/kLe at an adjacent key (see file-level comment); a kGt at the largest
-    // representable value (or kLt at the smallest) has no adjacent key to normalize to and
-    // correctly matches nothing, returning an empty vector without touching the tree.
+    // Returns every bucket now covering `pred` (predCounter already incremented on each) -
+    // see the file-level comment for the per-operator decomposition. kGt/kLt at the largest/
+    // smallest representable value (no adjacent key to normalize to) correctly match nothing,
+    // returning an empty vector without touching the tree.
     std::vector<LeafNode*> insertPredicate(const Predicate& pred) {
-        LeafNode* startNode = nullptr;
-        LeafNode* endNode = nullptr;
         switch (pred.op) {
+            case Op::kEq:
+                return {insertEq(pred.vals0)};
             case Op::kGe:
-                startNode = partition(pred.vals0, Op::kGe);
-                endNode = root_->leaf_l;
-                break;
+                return insertGe(pred.vals0);
             case Op::kGt: {
                 auto next = nextElementKey(shape_, pred.vals0);
                 if (!next) return {};
-                startNode = partition(*next, Op::kGe);
-                endNode = root_->leaf_l;
-                break;
+                return insertGe(*next);
             }
-            case Op::kEq:
-                startNode = partition(pred.vals0, Op::kEq);
-                endNode = startNode;
-                break;
+            case Op::kLe:
+                return insertLe(pred.vals0);
             case Op::kLt: {
                 auto prev = prevElementKey(shape_, pred.vals0);
                 if (!prev) return {};
-                startNode = root_->leaf_g;
-                endNode = partition(*prev, Op::kLe);
-                break;
+                return insertLe(*prev);
             }
-            case Op::kLe:
-                startNode = root_->leaf_g;
-                endNode = partition(pred.vals0, Op::kLe);
-                break;
             case Op::kIn:
-                // Not literal pseudocode - InsertPredicate's own Algorithm 1 only shows
-                // kGe/kEq/kLe explicitly. Derived by mirroring DeletePredicate's own kIn
-                // case (Algorithm 3, lines 13-17), which IS given explicitly and uses two
-                // separate boundary lookups, one per endpoint - so BETWEEN [lo,hi] is
-                // treated here as ">=lo" partitioned at the low end and "<=hi" partitioned
-                // at the high end, the natural insertion-side mirror of that lookup shape.
-                startNode = partition(pred.vals0, Op::kGe);
-                endNode = partition(pred.vals1, Op::kLe);
-                break;
+                return insertBetween(pred.vals0, pred.vals1);
         }
-        std::vector<LeafNode*> leafNodes;
-        LeafNode* cur = startNode;
-        LeafNode* stop = endNode->next;
-        while (cur != stop) {
-            cur->predCounter++;
-            leafNodes.push_back(cur);
-            cur = cur->next;
-        }
-        return leafNodes;
+        return {};
     }
 
-    // Algorithm 2, MatchPair. Locates the leaf whose predicate space covers `val`.
-    LeafNode* matchPair(const ElementKey& val) const {
-        InnerNode* currNode = root_;
-        std::vector<std::pair<InnerNode*, std::uint16_t>> path;
-        for (std::size_t level = 0; level < val.size(); ++level) {
-            std::uint16_t elem = val[level];
-            path.emplace_back(currNode, elem);
-            if (currNode->p[elem] != nullptr) {
-                currNode = currNode->p[elem];
-            } else {
-                InnerNode* iRNode = getRNode(path);
-                // See file-level comment #1: iRNode (not currNode, as literally printed).
-                InnerNode* iLNode = getLNode(iRNode);
-                return iLNode->leaf_l;
+    // Locates every bucket whose predicate space covers `val`.
+    std::vector<LeafNode*> matchPoint(const ElementKey& val) const {
+        std::vector<LeafNode*> results;
+        auto eqIt = equality_.find(val);
+        if (eqIt != equality_.end()) results.push_back(eqIt->second);
+
+        const InnerNode* node = root_;
+        for (std::size_t level = 0; level < val.size() && node != nullptr; ++level) {
+            std::uint16_t d = val[level];
+            auto geEnd = node->geMarkers.upper_bound(d);
+            for (auto it = node->geMarkers.begin(); it != geEnd; ++it) results.push_back(it->second);
+            auto leBegin = node->leMarkers.lower_bound(d);
+            for (auto it = leBegin; it != node->leMarkers.end(); ++it) results.push_back(it->second);
+            for (auto& entry : node->boundedMarkers) {
+                if (std::get<0>(entry) <= d && d <= std::get<1>(entry)) results.push_back(std::get<2>(entry));
             }
+            auto childIt = node->p.find(d);
+            node = (childIt != node->p.end()) ? childIt->second : nullptr;
         }
-        return currNode->leaf_e;
+        return results;
     }
 
-    // Algorithm 3, DeletePredicate. Decrements predCounter on every leaf `pred` covered.
-    // Does NOT free zero-counter leaves or merge survivors (see file-level comment).
-    // Returns every leaf that was decremented, in order. kGt/kLt normalize exactly as
-    // insertPredicate does (see there) - a kGt/kLt that inserted nothing (overflow/
-    // underflow at the domain edge) correctly deletes nothing either, since the same
-    // deterministic normalization recomputes the same "no adjacent key" result.
-    //
-    // Precondition (checked, not silently accepted): every leaf `pred` covers must have a
-    // predCounter of at least 1 before this call - i.e. `pred` (or something covering the
-    // exact same range) must actually have been inserted and not already fully deleted.
-    // predCounter is unsigned, so decrementing past zero would silently wrap to a huge
-    // value instead of failing loudly - guarded against explicitly since that would corrupt
-    // every future insert/delete/match touching this leaf in a way that's very hard to
-    // trace back to its actual cause (a caller bug: double-delete, or deleting something
-    // that was never inserted).
+    // Decrements predCounter on every bucket `pred` covers (throwing, not silently
+    // underflowing, if a bucket or inner-node path the deterministic decomposition expects to
+    // find doesn't exist - deleting a predicate that was never inserted, or double-deleting
+    // one). Returns every bucket touched, in the same shape insertPredicate would have
+    // produced for the identical `pred`. Buckets are not freed here - see the file-level
+    // comment.
     std::vector<LeafNode*> deletePredicate(const Predicate& pred) {
-        LeafNode* startNode = nullptr;
-        LeafNode* endNode = nullptr;
         switch (pred.op) {
+            case Op::kEq:
+                return {deleteEq(pred.vals0)};
             case Op::kGe:
-                startNode = matchPair(pred.vals0);
-                endNode = root_->leaf_l;
-                break;
+                return deleteGe(pred.vals0);
             case Op::kGt: {
                 auto next = nextElementKey(shape_, pred.vals0);
                 if (!next) return {};
-                startNode = matchPair(*next);
-                endNode = root_->leaf_l;
-                break;
+                return deleteGe(*next);
             }
-            case Op::kEq:
-                startNode = matchPair(pred.vals0);
-                endNode = startNode;
-                break;
+            case Op::kLe:
+                return deleteLe(pred.vals0);
             case Op::kLt: {
                 auto prev = prevElementKey(shape_, pred.vals0);
                 if (!prev) return {};
-                startNode = root_->leaf_g;
-                endNode = matchPair(*prev);
-                break;
+                return deleteLe(*prev);
             }
-            case Op::kLe:
-                startNode = root_->leaf_g;
-                endNode = matchPair(pred.vals0);
-                break;
             case Op::kIn:
-                startNode = matchPair(pred.vals0);
-                endNode = matchPair(pred.vals1);
-                break;
+                return deleteBetween(pred.vals0, pred.vals1);
         }
-        std::vector<LeafNode*> leafNodes;
-        LeafNode* cur = startNode;
-        LeafNode* stop = endNode->next;
-        while (cur != stop) {
-            if (cur->predCounter == 0) {
-                throw std::logic_error(
-                    "pstree: DeletePredicate would underflow a leaf's predCounter - "
-                    "deleting a predicate that was never inserted, or double-deleting one");
-            }
-            // See file-level comment #2: startNode (not the undefined `lNode`).
-            cur->predCounter -= 1;
-            leafNodes.push_back(cur);
-            cur = cur->next;
-        }
-        return leafNodes;
+        return {};
     }
 
     const KeyShape& shape() const { return shape_; }
@@ -318,242 +272,305 @@ public:
 private:
     KeyShape shape_;
     InnerNode* root_;
-    CloneUserData cloneUserData_;
     DestroyUserData destroyUserData_;
+    std::unordered_map<ElementKey, LeafNode*, detail::ElementKeyHash> equality_;
 
     std::uint32_t levelRadix(std::size_t level) const { return shape_.radix.at(level); }
+    static LeafNode* newBucket() { return new LeafNode(); }
 
-    // "The function CopyLeafNode creates a new leaf node by copying all information from
-    // an existing leaf node" (page 13 prose) - critically this includes `next`, captured
-    // at copy time BEFORE the caller redirects src->next to point at the new leaf. This is
-    // what makes the 3-leaf kEq/kIn split (partitionLeafNodeLeft) correct without an
-    // explicit final assignment: both new leaves are copied from the same source before
-    // either's `next` is touched, so the second (last) one already inherits the source's
-    // original downstream link. Also clones `userData` (see file-level comment #4) - not a
-    // static function anymore because of this, it needs the instance's own clone hook.
-    LeafNode* copyLeafNode(LeafNode* src) {
-        auto* dst = new LeafNode();
-        dst->predCounter = src->predCounter;
-        dst->next = src->next;
-        dst->userData = cloneUserData_ ? cloneUserData_(src->userData) : nullptr;
-        return dst;
+    LeafNode* insertEq(const ElementKey& v) {
+        LeafNode*& bucket = equality_[v];
+        if (bucket == nullptr) bucket = newBucket();
+        bucket->predCounter++;
+        return bucket;
     }
 
-    // `level` is the depth of the node being created (root = 0). A node created at the
-    // deepest level (depth == shape_.depth()) is never itself indexed via p[] - the walk
-    // that created it just consumed the last element of the key - so its own child array
-    // is left empty rather than sized from a radix entry that doesn't exist.
-    InnerNode* createInnerNode(std::size_t level) {
-        auto* node = new InnerNode();
-        if (level < shape_.depth()) {
-            node->p.assign(levelRadix(level), nullptr);
+    LeafNode* deleteEq(const ElementKey& v) {
+        auto it = equality_.find(v);
+        if (it == equality_.end() || it->second->predCounter == 0) {
+            throw std::logic_error(
+                "pstree: DeletePredicate would underflow an equality bucket's predCounter - "
+                "deleting a predicate that was never inserted, or double-deleting one");
         }
-        return node;
+        it->second->predCounter -= 1;
+        return it->second;
     }
 
-    // Assigns node->leaf_l, keeping l_refs (see LeafNode) consistent: removes `node` from
-    // its old target's back-reference list (if any) and adds it to the new one. Every
-    // `.leaf_l` assignment in this file goes through this - never assign the field
-    // directly - so l_refs is always an accurate answer to "who currently points at me".
-    static void setLeafL(InnerNode* node, LeafNode* newLeaf) {
-        if (node->leaf_l != nullptr) {
-            auto& refs = node->leaf_l->l_refs;
-            refs.erase(std::remove(refs.begin(), refs.end(), node), refs.end());
+    static LeafNode* decrementBucket(std::map<std::uint16_t, LeafNode*>& markers, std::uint16_t threshold) {
+        auto it = markers.find(threshold);
+        if (it == markers.end() || it->second->predCounter == 0) {
+            throw std::logic_error(
+                "pstree: DeletePredicate would underflow a bucket's predCounter - deleting a "
+                "predicate that was never inserted, or double-deleting one");
         }
-        node->leaf_l = newLeaf;
-        if (newLeaf != nullptr) newLeaf->l_refs.push_back(node);
+        it->second->predCounter -= 1;
+        return it->second;
     }
 
-    // Redirects every InnerNode currently pointing at `oldLeaf` via `.leaf_l` (except
-    // `exclude`, always the node performing the current split - its own `.leaf_l` is being
-    // managed directly by its caller in the same operation, not through this generic path)
-    // to `newLeaf` instead. Also propagates to `.leaf_e` wherever it was self-aliased with
-    // the old `.leaf_l` value (only possible for a node created via kLe wiring, where they
-    // start equal - see file-level comment #3). Safe to call unconditionally even when
-    // `oldLeaf` has no other referrers: the loop body just never runs.
-    //
-    // Why every entry in oldLeaf->l_refs is guaranteed to need this redirect (not just some
-    // of them): oldLeaf currently represents a single undivided range up to the new split
-    // point V. Any node with `.leaf_l == oldLeaf` must have a value >= V - if it were
-    // strictly between oldLeaf's own start and V, oldLeaf would already have been split at
-    // that point by that node's own earlier insertion, contradicting "oldLeaf is currently
-    // undivided up to V". So every referrer's `.leaf_l` should now point past V, at
-    // whichever new piece extends rightward from the split - exactly `newLeaf`.
-    static void redirectLeafLRefs(LeafNode* oldLeaf, LeafNode* newLeaf, InnerNode* exclude) {
-        std::vector<InnerNode*> refs = oldLeaf->l_refs; // copy - setLeafL mutates the original mid-loop
-        for (InnerNode* node : refs) {
-            if (node == exclude) continue;
-            if (node->leaf_e == oldLeaf) node->leaf_e = newLeaf;
-            setLeafL(node, newLeaf);
-        }
-    }
-
-    // Algorithm 1, GetRNode: walk back up `path` (built while descending) looking for the
-    // nearest ancestor with an existing child strictly to the right of the path taken.
-    InnerNode* getRNode(const std::vector<std::pair<InnerNode*, std::uint16_t>>& path) const {
-        for (std::size_t i = path.size(); i-- > 0;) {
-            auto [node, elem] = path[i];
-            std::uint32_t length = levelRadix(i);
-            for (std::uint32_t pos = elem + 1; pos < length; ++pos) {
-                if (node->p[pos] != nullptr) return node->p[pos];
-            }
-            if (i == 0) return node; // exhausted the path - root itself
-        }
-        return root_;
-    }
-
-    // Algorithm 1, GetLNode: descend into the leftmost existing child repeatedly, until
-    // reaching a node whose `l` link is set.
-    InnerNode* getLNode(InnerNode* iRNode) const {
-        if (iRNode == root_) return root_;
-        InnerNode* iLNode = iRNode;
-        while (iLNode->leaf_l == nullptr) {
-            bool found = false;
-            for (std::size_t pos = 0; pos < iLNode->p.size(); ++pos) {
-                if (iLNode->p[pos] != nullptr) {
-                    iLNode = iLNode->p[pos];
-                    found = true;
-                    break;
+    // GE-style decomposition rooted at an arbitrary (node, level) - used both for a top-level
+    // ">=V" (rooted at the tree's actual root, level 0) and for kIn's lo-branch (rooted one
+    // level past the lca node). See the file-level comment for the per-level guard/threshold
+    // derivation.
+    std::vector<LeafNode*> geFrom(InnerNode* startNode, const ElementKey& v, std::size_t startLevel) {
+        std::vector<LeafNode*> result;
+        InnerNode* node = startNode;
+        const std::size_t depth = v.size();
+        for (std::size_t level = startLevel; level < depth; ++level) {
+            std::uint16_t d = v[level];
+            if (level == depth - 1) {
+                LeafNode*& bucket = node->geMarkers[d];
+                if (bucket == nullptr) bucket = newBucket();
+                bucket->predCounter++;
+                result.push_back(bucket);
+            } else {
+                if (static_cast<std::uint32_t>(d) + 1 < levelRadix(level)) {
+                    LeafNode*& bucket = node->geMarkers[static_cast<std::uint16_t>(d + 1)];
+                    if (bucket == nullptr) bucket = newBucket();
+                    bucket->predCounter++;
+                    result.push_back(bucket);
                 }
-            }
-            if (!found) {
-                throw std::logic_error("pstree: GetLNode could not descend - malformed tree");
+                InnerNode*& child = node->p[d];
+                if (child == nullptr) child = new InnerNode();
+                node = child;
             }
         }
-        return iLNode;
+        return result;
     }
 
-    // Algorithm 1, Partition. Walks/creates the inner-node path for `val`, then splits the
-    // leaf at that boundary (creating it if necessary) according to `op` (kGe/kEq/kLe
-    // only - kIn's two endpoints are each partitioned separately as kGe/kLe by the caller).
-    // Always returns currNode->leaf_e (paper line 30, unconditional) - by construction
-    // (see partitionLeafNodeLeft/Equal) leaf_e always ends up representing the correct
-    // "up to and including V" boundary for kLe too, whether it was freshly split off this
-    // call or already existed from an earlier insertion at the same point.
-    LeafNode* partition(const ElementKey& val, Op op) {
-        InnerNode* currNode = root_;
-        std::vector<std::pair<InnerNode*, std::uint16_t>> path;
-        for (std::size_t level = 0; level < val.size(); ++level) {
-            std::uint16_t elem = val[level];
-            path.emplace_back(currNode, elem);
-            if (currNode->p[elem] == nullptr) {
-                currNode->p[elem] = createInnerNode(level + 1);
+    // LE-style mirror of geFrom - guarded by `d > 0` (not `d + 1 < radix`), since it marks
+    // siblings strictly LESS than d, and threshold is unsigned (d==0 has no valid "d-1").
+    std::vector<LeafNode*> leFrom(InnerNode* startNode, const ElementKey& v, std::size_t startLevel) {
+        std::vector<LeafNode*> result;
+        InnerNode* node = startNode;
+        const std::size_t depth = v.size();
+        for (std::size_t level = startLevel; level < depth; ++level) {
+            std::uint16_t d = v[level];
+            if (level == depth - 1) {
+                LeafNode*& bucket = node->leMarkers[d];
+                if (bucket == nullptr) bucket = newBucket();
+                bucket->predCounter++;
+                result.push_back(bucket);
+            } else {
+                if (d > 0) {
+                    LeafNode*& bucket = node->leMarkers[static_cast<std::uint16_t>(d - 1)];
+                    if (bucket == nullptr) bucket = newBucket();
+                    bucket->predCounter++;
+                    result.push_back(bucket);
+                }
+                InnerNode*& child = node->p[d];
+                if (child == nullptr) child = new InnerNode();
+                node = child;
             }
-            currNode = currNode->p[elem];
         }
-        if (currNode->leaf_e == nullptr) {
-            InnerNode* iRNode = getRNode(path);
-            InnerNode* iLNode = getLNode(iRNode);
-            partitionLeafNodeLeft(currNode, iLNode, op);
-        } else {
-            partitionLeafNodeEqual(currNode, op);
-        }
-        return currNode->leaf_e;
+        return result;
     }
 
-    // Algorithm 1, PartitionLeafNodeEqual (lines 58-77) - currNode already has an
-    // exact-match boundary (currNode->leaf_e != null); further split it based on `op`.
-    // Transcribed directly: kGe further splits currNode.l/e apart if they're still the
-    // same leaf; kLe further splits currNode.e/g apart if they're still the same leaf;
-    // kEq does whichever of the two is still needed (both can be pending at once the
-    // first time a `=` predicate meets a boundary another operator already created). Every
-    // branch additionally calls redirectLeafLRefs on the leaf being narrowed - see file-
-    // level comment #3 for why any node other than currNode referencing that leaf via
-    // `.leaf_l` needs updating too, not just currNode's own fields.
-    void partitionLeafNodeEqual(InnerNode* currNode, Op op) {
-        if (op == Op::kGe) {
-            if (currNode->leaf_l == currNode->leaf_e) {
-                LeafNode* oldLeaf = currNode->leaf_l;
-                LeafNode* leafNode = copyLeafNode(oldLeaf);
-                oldLeaf->next = leafNode;
-                currNode->leaf_e = leafNode;
-                redirectLeafLRefs(oldLeaf, leafNode, currNode);
-            }
-        } else if (op == Op::kLe) {
-            if (currNode->leaf_e == currNode->leaf_g) {
-                LeafNode* oldLeaf = currNode->leaf_e;
-                LeafNode* leafNode = copyLeafNode(oldLeaf);
-                oldLeaf->next = leafNode;
-                currNode->leaf_g = leafNode;
-                redirectLeafLRefs(oldLeaf, leafNode, currNode);
-            }
-        } else if (op == Op::kEq) {
-            if (currNode->leaf_e == currNode->leaf_g) {
-                LeafNode* oldLeaf = currNode->leaf_e;
-                LeafNode* leafNode = copyLeafNode(oldLeaf);
-                oldLeaf->next = leafNode;
-                currNode->leaf_g = leafNode;
-                redirectLeafLRefs(oldLeaf, leafNode, currNode);
-            } else if (currNode->leaf_l == currNode->leaf_e) {
-                LeafNode* oldLeaf = currNode->leaf_l;
-                LeafNode* leafNode = copyLeafNode(oldLeaf);
-                oldLeaf->next = leafNode;
-                currNode->leaf_e = leafNode;
-                redirectLeafLRefs(oldLeaf, leafNode, currNode);
+    // Delete-side mirrors of geFrom/leFrom: find (never create) the same path/buckets a
+    // matching insert would have produced, decrementing instead of incrementing. Throws if the
+    // deterministic walk expects a bucket or inner-node path that isn't there.
+    std::vector<LeafNode*> geFromDelete(InnerNode* startNode, const ElementKey& v, std::size_t startLevel) {
+        std::vector<LeafNode*> result;
+        InnerNode* node = startNode;
+        const std::size_t depth = v.size();
+        for (std::size_t level = startLevel; level < depth; ++level) {
+            std::uint16_t d = v[level];
+            if (level == depth - 1) {
+                result.push_back(decrementBucket(node->geMarkers, d));
+            } else {
+                if (static_cast<std::uint32_t>(d) + 1 < levelRadix(level)) {
+                    result.push_back(decrementBucket(node->geMarkers, static_cast<std::uint16_t>(d + 1)));
+                }
+                auto it = node->p.find(d);
+                if (it == node->p.end()) {
+                    throw std::logic_error(
+                        "pstree: DeletePredicate could not find the expected inner-node path - "
+                        "deleting a predicate that was never inserted, or double-deleting one");
+                }
+                node = it->second;
             }
         }
+        return result;
     }
 
-    // Algorithm 1, PartitionLeafNodeLeft (lines 79-102) - no exact-match boundary exists
-    // yet; iLNode->leaf_l points to the (undivided) leaf currently spanning across `val`.
-    // Transcribed directly: kGe carves off "[V,...)" as a new leaf, old leaf keeps
-    // "<V" (currNode.l). kLe carves off "(V,...)" as a new leaf (currNode.g), old leaf
-    // absorbs "=V" too and becomes the "(...,V]" boundary (currNode.e AND currNode.l both
-    // point at it) - this is the paper's literal ">"-operator wiring (lines 87-93), reused
-    // here for kLe: `<=V` and `>V` are complementary partitions of the exact same point,
-    // so they necessarily share one tree structure, differing only in which side
-    // InsertPredicate/DeletePredicate walk from - see this file's kGt/kLt comment above.
-    // kEq carves off two new leaves, "=V" and ">V"; old leaf keeps "<V" unchanged.
-    //
-    // Every branch calls redirectLeafLRefs on oldLeaf at the end - see file-level comment
-    // #3: iLNode itself is always among oldLeaf's referrers (that's how it was found), so
-    // the redirect naturally updates it (and its `.leaf_e` if that was self-aliased too),
-    // exactly reproducing what the literal pseudocode's own `iLNode.l = ...` line intended
-    // - plus correctly fixing up any OTHER already-existing node sharing the same stale
-    // reference, which the literal pseudocode has no mechanism for at all.
-    void partitionLeafNodeLeft(InnerNode* currNode, InnerNode* iLNode, Op op) {
-        LeafNode* oldLeaf = iLNode->leaf_l;
-        if (op == Op::kGe) {
-            LeafNode* leafNode = copyLeafNode(oldLeaf);
-            oldLeaf->next = leafNode;
-            setLeafL(currNode, oldLeaf);
-            currNode->leaf_e = leafNode;
-            currNode->leaf_g = leafNode;
-            redirectLeafLRefs(oldLeaf, leafNode, currNode);
-        } else if (op == Op::kLe) {
-            LeafNode* leafNode = copyLeafNode(oldLeaf);
-            oldLeaf->next = leafNode;
-            setLeafL(currNode, oldLeaf);
-            currNode->leaf_e = oldLeaf;
-            currNode->leaf_g = leafNode;
-            redirectLeafLRefs(oldLeaf, leafNode, currNode);
-        } else if (op == Op::kEq) {
-            LeafNode* leafNodeOne = copyLeafNode(oldLeaf);
-            LeafNode* leafNodeTwo = copyLeafNode(oldLeaf);
-            oldLeaf->next = leafNodeOne;
-            leafNodeOne->next = leafNodeTwo;
-            setLeafL(currNode, oldLeaf);
-            currNode->leaf_e = leafNodeOne;
-            currNode->leaf_g = leafNodeTwo;
-            redirectLeafLRefs(oldLeaf, leafNodeTwo, currNode);
+    std::vector<LeafNode*> leFromDelete(InnerNode* startNode, const ElementKey& v, std::size_t startLevel) {
+        std::vector<LeafNode*> result;
+        InnerNode* node = startNode;
+        const std::size_t depth = v.size();
+        for (std::size_t level = startLevel; level < depth; ++level) {
+            std::uint16_t d = v[level];
+            if (level == depth - 1) {
+                result.push_back(decrementBucket(node->leMarkers, d));
+            } else {
+                if (d > 0) {
+                    result.push_back(decrementBucket(node->leMarkers, static_cast<std::uint16_t>(d - 1)));
+                }
+                auto it = node->p.find(d);
+                if (it == node->p.end()) {
+                    throw std::logic_error(
+                        "pstree: DeletePredicate could not find the expected inner-node path - "
+                        "deleting a predicate that was never inserted, or double-deleting one");
+                }
+                node = it->second;
+            }
         }
+        return result;
+    }
+
+    std::vector<LeafNode*> insertGe(const ElementKey& v) { return geFrom(root_, v, 0); }
+    std::vector<LeafNode*> insertLe(const ElementKey& v) { return leFrom(root_, v, 0); }
+    std::vector<LeafNode*> deleteGe(const ElementKey& v) { return geFromDelete(root_, v, 0); }
+    std::vector<LeafNode*> deleteLe(const ElementKey& v) { return leFromDelete(root_, v, 0); }
+
+    static LeafNode* getOrCreateBoundedBucket(InnerNode* node, std::uint16_t lo, std::uint16_t hi) {
+        for (auto& entry : node->boundedMarkers) {
+            if (std::get<0>(entry) == lo && std::get<1>(entry) == hi) return std::get<2>(entry);
+        }
+        LeafNode* bucket = newBucket();
+        node->boundedMarkers.emplace_back(lo, hi, bucket);
+        return bucket;
+    }
+
+    static LeafNode* decrementBoundedBucket(InnerNode* node, std::uint16_t lo, std::uint16_t hi) {
+        for (auto& entry : node->boundedMarkers) {
+            if (std::get<0>(entry) == lo && std::get<1>(entry) == hi) {
+                LeafNode* bucket = std::get<2>(entry);
+                if (bucket->predCounter == 0) {
+                    throw std::logic_error(
+                        "pstree: DeletePredicate would underflow a bounded bucket's predCounter - "
+                        "deleting a predicate that was never inserted, or double-deleting one");
+                }
+                bucket->predCounter -= 1;
+                return bucket;
+            }
+        }
+        throw std::logic_error(
+            "pstree: DeletePredicate could not find the expected bounded marker (kIn) - "
+            "deleting a predicate that was never inserted, or double-deleting one");
+    }
+
+    // BETWEEN[lo,hi] (kIn) - see the file-level comment for the full derivation, including why
+    // lo==hi and "lca is the last level" are both required (not optional) base cases.
+    std::vector<LeafNode*> insertBetween(const ElementKey& lo, const ElementKey& hi) {
+        if (lo == hi) return {insertEq(lo)};
+        const std::size_t depth = lo.size();
+        std::size_t lcaLevel = 0;
+        while (lcaLevel < depth && lo[lcaLevel] == hi[lcaLevel]) ++lcaLevel;
+
+        InnerNode* node = root_;
+        for (std::size_t level = 0; level < lcaLevel; ++level) {
+            InnerNode*& child = node->p[lo[level]];
+            if (child == nullptr) child = new InnerNode();
+            node = child;
+        }
+
+        std::uint16_t loD = lo[lcaLevel];
+        std::uint16_t hiD = hi[lcaLevel]; // hiD > loD guaranteed: shared prefix through lcaLevel-1, lo < hi overall
+
+        if (lcaLevel == depth - 1) {
+            // No deeper level exists to refine "digit == loD"/"digit == hiD" further - the
+            // whole range collapses to one inclusive bounded marker at the lca node itself.
+            LeafNode* bucket = getOrCreateBoundedBucket(node, loD, hiD);
+            bucket->predCounter++;
+            return {bucket};
+        }
+
+        std::vector<LeafNode*> result;
+        if (static_cast<std::uint32_t>(loD) + 1 <= static_cast<std::uint32_t>(hiD) - 1) {
+            LeafNode* bucket = getOrCreateBoundedBucket(
+                node, static_cast<std::uint16_t>(loD + 1), static_cast<std::uint16_t>(hiD - 1));
+            bucket->predCounter++;
+            result.push_back(bucket);
+        }
+
+        InnerNode*& loChild = node->p[loD];
+        if (loChild == nullptr) loChild = new InnerNode();
+        auto loResults = geFrom(loChild, lo, lcaLevel + 1);
+        result.insert(result.end(), loResults.begin(), loResults.end());
+
+        InnerNode*& hiChild = node->p[hiD];
+        if (hiChild == nullptr) hiChild = new InnerNode();
+        auto hiResults = leFrom(hiChild, hi, lcaLevel + 1);
+        result.insert(result.end(), hiResults.begin(), hiResults.end());
+
+        return result;
+    }
+
+    std::vector<LeafNode*> deleteBetween(const ElementKey& lo, const ElementKey& hi) {
+        if (lo == hi) return {deleteEq(lo)};
+        const std::size_t depth = lo.size();
+        std::size_t lcaLevel = 0;
+        while (lcaLevel < depth && lo[lcaLevel] == hi[lcaLevel]) ++lcaLevel;
+
+        InnerNode* node = root_;
+        for (std::size_t level = 0; level < lcaLevel; ++level) {
+            auto it = node->p.find(lo[level]);
+            if (it == node->p.end()) {
+                throw std::logic_error(
+                    "pstree: DeletePredicate could not find the expected inner-node path (kIn) - "
+                    "deleting a predicate that was never inserted, or double-deleting one");
+            }
+            node = it->second;
+        }
+
+        std::uint16_t loD = lo[lcaLevel];
+        std::uint16_t hiD = hi[lcaLevel];
+
+        if (lcaLevel == depth - 1) {
+            return {decrementBoundedBucket(node, loD, hiD)};
+        }
+
+        std::vector<LeafNode*> result;
+        if (static_cast<std::uint32_t>(loD) + 1 <= static_cast<std::uint32_t>(hiD) - 1) {
+            result.push_back(decrementBoundedBucket(
+                node, static_cast<std::uint16_t>(loD + 1), static_cast<std::uint16_t>(hiD - 1)));
+        }
+
+        auto loIt = node->p.find(loD);
+        if (loIt == node->p.end()) {
+            throw std::logic_error(
+                "pstree: DeletePredicate could not find the expected lo-branch path (kIn) - "
+                "deleting a predicate that was never inserted, or double-deleting one");
+        }
+        auto loResults = geFromDelete(loIt->second, lo, lcaLevel + 1);
+        result.insert(result.end(), loResults.begin(), loResults.end());
+
+        auto hiIt = node->p.find(hiD);
+        if (hiIt == node->p.end()) {
+            throw std::logic_error(
+                "pstree: DeletePredicate could not find the expected hi-branch path (kIn) - "
+                "deleting a predicate that was never inserted, or double-deleting one");
+        }
+        auto hiResults = leFromDelete(hiIt->second, hi, lcaLevel + 1);
+        result.insert(result.end(), hiResults.begin(), hiResults.end());
+
+        return result;
     }
 
     void destroy() {
-        LeafNode* leaf = root_ != nullptr ? root_->leaf_g : nullptr;
-        while (leaf != nullptr) {
-            LeafNode* next = leaf->next;
-            if (destroyUserData_) destroyUserData_(leaf->userData);
-            delete leaf;
-            leaf = next;
+        for (auto& [key, bucket] : equality_) {
+            if (destroyUserData_) destroyUserData_(bucket->userData);
+            delete bucket;
         }
+        equality_.clear();
         destroyInner(root_);
         root_ = nullptr;
     }
 
-    static void destroyInner(InnerNode* node) {
+    void destroyInner(InnerNode* node) {
         if (node == nullptr) return;
-        for (InnerNode* child : node->p) {
+        for (auto& [threshold, bucket] : node->geMarkers) {
+            if (destroyUserData_) destroyUserData_(bucket->userData);
+            delete bucket;
+        }
+        for (auto& [threshold, bucket] : node->leMarkers) {
+            if (destroyUserData_) destroyUserData_(bucket->userData);
+            delete bucket;
+        }
+        for (auto& entry : node->boundedMarkers) {
+            if (destroyUserData_) destroyUserData_(std::get<2>(entry)->userData);
+            delete std::get<2>(entry);
+        }
+        for (auto& [digit, child] : node->p) {
             destroyInner(child);
         }
         delete node;

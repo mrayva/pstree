@@ -17,25 +17,36 @@ existing codebase.
 (`engine: pstree`) - see that repo's own README.md for the operator-support/limitations summary.
 PSTParallel (Phase 4) remains deliberately not started.
 
-**Independent benchmark against a-tree/be-tree (`nats_sidecar`'s `benchmarks/matching_engine_bench.cpp`,
-see that repo's README for the full writeup and numbers) found a real, architectural scaling
-limitation, not a bug**: `PSTDynamic::insertSubscription()` must attach a subscription to *every
-leaf* its access predicate's range covers (required for `MatchEvent`'s O(1) per-event lookup
-contract to hold), which is cheap for an equality/narrow-range access predicate but degrades toward
-O(leaf-count) per insertion - and O(group-size) per matching event - when a subscription's *only*
-available predicate is a wide, unbounded comparison (`price > X`) and many such subscriptions with
-independent thresholds share a dimension. Measured: at K=10,000 synthetic subscriptions (30% of
-which are exactly this shape), pstree's insert rate falls to ~1.4% of a-tree's and its search rate
-to ~15% of a-tree's - a real, growing-with-K disadvantage, not a fixed constant-factor gap. This
-doesn't contradict the paper's own results (likely measured on workloads with narrower/bounded
-access predicates) but does mean PSTDynamic as implemented here isn't a good fit for a workload
-dominated by independent wide-range "threshold alert" subscriptions.
+**A real, architectural scaling limitation was found via `nats_sidecar`'s own
+`benchmarks/matching_engine_bench.cpp` benchmark, then FIXED (not just documented)**: the paper's
+own design (`InsertPredicate` materializing coverage on every leaf a range predicate spans) made
+`PSTDynamic::insertSubscription()` degrade toward O(leaf-count) per insertion - and O(group-size)
+per matching event - whenever a subscription's *only* available predicate was a wide, unbounded
+comparison (`price > X`) and many such subscriptions with independent thresholds shared a
+dimension. Measured at K=10,000 synthetic subscriptions (30% of which were exactly this shape):
+insert throughput fell to ~1.4% of a competing engine's, search throughput to ~15% - a real,
+growing-with-K disadvantage, not a fixed constant-factor gap.
 
-**Phase 1 complete**: the PS-Tree index itself (Algorithms 1-3 - `InsertPredicate`, `MatchPair`,
-`DeletePredicate`), including strict `>`/`<` support, domain-boundary edge cases, and a randomized
-property-based stress test (checked against a brute-force oracle across dozens of seeds and
-thousands of operations each) validating the whole insert/delete/match pipeline, not just the
-worked examples.
+**Fixed by replacing the leaf-chain materialization with canonical ancestor markers** (see
+`include/pstree/ps_tree.hpp`'s own file-level comment for the full derivation) - the classical
+"canonical decomposition" technique for stabbing queries, generalized from a binary segment tree to
+the multiway radix trie the value encoding already produces. Equality now uses a plain hashmap
+(O(1), unaffected by any of this - it never had the scaling problem); range operators
+(`>=`,`>`,`<=`,`<`,BETWEEN) now attach to O(depth) ancestor nodes instead of O(leaves-covered)
+leaves - a small, per-attribute-type constant (16 for int64/double, <=128 for string) independent
+of how many other predicates exist on that dimension. **This supersedes the paper's own Algorithms
+1-3 for range operators specifically** - not a transcription anymore, a from-scratch fix for a real,
+measured limitation of that design (equality and the overall PSTDynamic layer - access-predicate
+selection, dimension-signature grouping - are unaffected and unchanged). See
+`mrayva/nats_sidecar`'s own README for the re-measured benchmark numbers after this fix.
+
+**Phase 1 complete**: the PS-Tree index itself (`InsertPredicate`, `MatchPoint`,
+`DeletePredicate` - originally a transcription of the paper's own Algorithms 1-3, now superseded
+for range operators by the canonical-ancestor-marker redesign above), including strict `>`/`<`
+support, domain-boundary edge cases, and a randomized property-based stress test (checked against
+a brute-force oracle across dozens of seeds and thousands of operations each, plus an exhaustive
+small-domain BETWEEN check) validating the whole insert/delete/match pipeline, not just the worked
+examples.
 
 **Phase 2 complete**: PSTDynamic (Algorithms 4-6 - `InsertSubscription`, `MatchEvent`,
 `DeleteSubscription`), including the access-predicate selectivity heuristic, dimension-signature
@@ -51,13 +62,55 @@ multi-seed runs (60+ seeds, up to 3000 operations each) before being considered 
 build on. PSTParallel (Algorithm 7, the multicore extension) is deliberately not started - see the
 plan/TODO below.
 
-## Design notes and deliberate deviations from the paper
+## PS-Tree redesign: canonical ancestor markers (2026-08-27)
+
+Supersedes Algorithms 1-3 for range operators (`>=`,`>`,`<=`,`<`,BETWEEN) - see
+[`include/pstree/ps_tree.hpp`](include/pstree/ps_tree.hpp)'s own file-level comment for the full
+derivation; equality and everything in PSTDynamic (access-predicate selection, dimension-signature
+grouping, the Section 2.1 predicate evaluator) are unaffected. A few implementation-time findings
+worth recording, beyond what an independent design review (which the redesign was validated
+against before implementation) already caught:
+
+- **BETWEEN's `lo==hi` case is a required base case, not an optimization**: the general LCA
+  decomposition has no defined "first level where lo/hi digits differ" when they're equal - this
+  is reachable in practice (`test_pst_dynamic_stress.cpp`'s random BETWEEN generator hits it,
+  especially on boolean dimensions), not just a hypothetical edge case.
+- **BETWEEN's `lcaLevel == depth-1` case needed its own handling, found only while implementing
+  (not caught by the design review)**: when lo and hi diverge only at the LAST digit level, there
+  is no deeper level to descend into for either branch - naively descending into "child loD" and
+  running the same GE-style decomposition starting past the end of the key silently does nothing,
+  losing lo's own inclusion entirely. The whole range collapses to one inclusive bounded marker at
+  the shared ancestor node instead.
+- **Buckets are deliberately never freed when their `predCounter` reaches zero, unlike an earlier
+  draft of this design.** PSTDynamic's own per-bucket group state (`LeafNode::userData`) is read
+  and mutated by the *caller* strictly after `insertPredicate`/`deletePredicate` returns the bucket
+  list - freeing a zero-counter bucket eagerly, inside the delete call itself, would leave that
+  access reading freed memory. A zero-counter "zombie" bucket costs a small, bounded amount of
+  memory (mirroring the original leaf-chain design's own deferred "MergeSpaces" stance, just for a
+  different underlying reason) and is otherwise harmless.
+- **`boundedMarkers`' linear scan is real, tracked residual debt**, not swept under "not reachable
+  today": if many BETWEEN predicates ever shared the same LCA node, that node's scan would
+  reintroduce an O(K)-shaped cost for that one operator specifically. Confirmed unreachable from
+  `nats_sidecar`'s current dialect translation layer (no BETWEEN support there at all), so out of
+  scope for this fix, but worth tracking if that ever changes.
+- Verification: the existing worked-example and edge-case tests were re-derived (not just
+  mechanically ported) against the new bucket model, `test_pst_dynamic.cpp`/
+  `test_pst_dynamic_stress.cpp` needed **zero** changes (both exercise only `PSTDynamic`'s public
+  API), and a new exhaustive small-domain BETWEEN test plus a direct complexity-regression test
+  (a wide `>=` insertion's own touched-bucket count stays `O(depth)` regardless of how many other
+  predicates already exist) were added - there was previously no test pinning the complexity claim
+  itself, only functional correctness of a single insert. Clean under ASan+UBSan with leak
+  detection, including a 10-seed ad-hoc confidence run beyond what's checked in.
+
+## Design notes and deliberate deviations from the paper (original Algorithm 1-3 transcription -
+superseded for range operators by the redesign above; equality's own PartitionLeafNodeEqual-style
+handling and everything below about it is now historical)
 
 This implementation transcribes the paper's pseudocode directly wherever it's given, but the
 pseudocode has real gaps and at least one apparent transcription error, found by cross-checking
 against the paper's own worked examples rather than assumed. See the top-of-file comments in
-[`include/pstree/ps_tree.hpp`](include/pstree/ps_tree.hpp) and
-[`include/pstree/order_key.hpp`](include/pstree/order_key.hpp) for the full detail on each; briefly:
+[`include/pstree/order_key.hpp`](include/pstree/order_key.hpp) for value-encoding detail unaffected
+by the redesign; briefly, on the now-superseded original design:
 
 - **Value-type element encoding** (Section 4.5) is generalized rather than copying the paper's own
   irregular per-type bit splits: every fixed-width numeric type (`int64_t`, `double`) is encoded
@@ -168,8 +221,10 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
 
 ## TODO
 
-- [x] PS-Tree core (`InsertPredicate`/`MatchPair`/`DeletePredicate`), strict `>`/`<`, domain-edge
+- [x] PS-Tree core (`InsertPredicate`/`MatchPoint`/`DeletePredicate`), strict `>`/`<`, domain-edge
       cases, randomized stress testing.
+- [x] Canonical-ancestor-marker redesign for range operators, fixing the O(leaf-count) wide-range
+      insertion cost found via `nats_sidecar`'s benchmark - see the dedicated section above.
 - [x] PSTDynamic (Algorithms 4-6): access-predicate selection, dimension-signature (Bloom filter)
       grouping, `InsertSubscription`/`MatchEvent`/`DeleteSubscription`, own predicate evaluator.
 - [x] `nats_sidecar` integration as a third pluggable matching engine (`engine: pstree`) - see
@@ -184,5 +239,8 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_
       integration rejects these at subscribe time instead (see above).
 - [ ] PSTParallel (Algorithm 7) - a much bigger, separate architectural lift, deliberately not
       scoped yet.
-- [ ] Space merging / zero-counter leaf reclamation (deferred, see design notes above) - not a
-      correctness requirement, but real memory growth under long-running insert/delete churn.
+- [ ] Zero-counter bucket reclamation (deferred, see the redesign section above for why eager
+      freeing on decrement is unsafe as-is) - not a correctness requirement, but real memory growth
+      under long-running insert/delete churn.
+- [ ] `boundedMarkers`' linear scan (BETWEEN only) has no asymptotic guarantee - tracked residual
+      debt, not currently reachable from `nats_sidecar`'s dialect layer (see the redesign section).

@@ -266,17 +266,21 @@ public:
             const DimensionIndex& dim = dimIt->second;
 
             ElementKey key = detail::encodeValue(pair.val, dim.schema);
-            LeafNode* leaf = dim.tree.matchPair(key);
-            if (leaf->userData == nullptr) continue; // no subscription ever attached to this leaf
+            // A point can now be covered by several buckets at once (an equality bucket plus
+            // any number of ancestor range markers along its path - see ps_tree.hpp's
+            // canonical-decomposition redesign), not just one leaf.
+            for (LeafNode* leaf : dim.tree.matchPoint(key)) {
+                if (leaf->userData == nullptr) continue; // no subscription ever attached to this bucket
 
-            const LeafGroupState& state = *static_cast<LeafGroupState*>(leaf->userData);
-            DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
-            for (auto& [groupSig, ids] : state.groups) {
-                if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
-                for (auto id : ids) {
-                    const Subscription& sub = subscriptions_.at(id);
-                    if (matchSubscription(event, sub)) {
-                        matchingSubs.push_back(id);
+                const LeafGroupState& state = *static_cast<LeafGroupState*>(leaf->userData);
+                DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
+                for (auto& [groupSig, ids] : state.groups) {
+                    if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
+                    for (auto id : ids) {
+                        const Subscription& sub = subscriptions_.at(id);
+                        if (matchSubscription(event, sub)) {
+                            matchingSubs.push_back(id);
+                        }
                     }
                 }
             }
@@ -346,15 +350,11 @@ private:
         std::unordered_map<DimSig, std::vector<std::uint64_t>, DimSig::Hasher> groups;
     };
 
-    static void* cloneLeafGroupState(void* p) {
-        if (p == nullptr) return nullptr;
-        return new LeafGroupState(*static_cast<LeafGroupState*>(p));
-    }
     static void destroyLeafGroupState(void* p) { delete static_cast<LeafGroupState*>(p); }
 
     struct DimensionIndex {
         explicit DimensionIndex(AttrSchema s)
-            : schema(std::move(s)), tree(detail::shapeFor(schema), cloneLeafGroupState, destroyLeafGroupState) {}
+            : schema(std::move(s)), tree(detail::shapeFor(schema), destroyLeafGroupState) {}
         AttrSchema schema;
         PSTree tree;
     };

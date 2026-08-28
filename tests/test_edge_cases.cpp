@@ -1,7 +1,9 @@
-// Edge-case hardening for PS-Tree, beyond the core Algorithm 1-3 correctness tests in
-// test_ps_tree.cpp: strict >/< (kGt/kLt), domain-boundary overflow/underflow, duplicate
-// and double-delete handling, repeated insert/delete churn (leak/UAF exposure under ASan),
-// and multi-way (3+) overlapping ranges.
+// Edge-case hardening for PS-Tree, beyond the core correctness tests in test_ps_tree.cpp:
+// strict >/< (kGt/kLt), domain-boundary overflow/underflow, duplicate and double-delete
+// handling, repeated insert/delete churn (leak/UAF exposure under ASan), and multi-way (3+)
+// overlapping ranges. `sumCoverage()` sums predCounter across every bucket matchPoint()
+// returns for a value - the canonical-ancestor-marker redesign's replacement for the old
+// single-leaf `matchPair(v)->predCounter` read (see ps_tree.hpp's own file-level comment).
 
 #include <cstdint>
 #include <iostream>
@@ -26,23 +28,31 @@ pstree::Predicate simple(pstree::Op op, std::int64_t v) {
     return pstree::Predicate{op, pstree::Int64Codec::encode(v), {}};
 }
 
+std::uint64_t sumCoverage(const pstree::PSTree& tree, std::int64_t v) {
+    std::uint64_t total = 0;
+    for (pstree::LeafNode* bucket : tree.matchPoint(pstree::Int64Codec::encode(v))) {
+        total += bucket->predCounter;
+    }
+    return total;
+}
+
 void test_strict_gt_lt_int64() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     auto pGt = simple(pstree::Op::kGt, 10);
     tree.insertPredicate(pGt);
-    require(tree.matchPair(pstree::Int64Codec::encode(11))->predCounter == 1, "kGt: value above boundary included");
-    require(tree.matchPair(pstree::Int64Codec::encode(10))->predCounter == 0, "kGt: boundary value itself excluded");
-    require(tree.matchPair(pstree::Int64Codec::encode(9))->predCounter == 0, "kGt: value below boundary excluded");
+    require(sumCoverage(tree, 11) == 1, "kGt: value above boundary included");
+    require(sumCoverage(tree, 10) == 0, "kGt: boundary value itself excluded");
+    require(sumCoverage(tree, 9) == 0, "kGt: value below boundary excluded");
     tree.deletePredicate(pGt);
-    require(tree.matchPair(pstree::Int64Codec::encode(11))->predCounter == 0, "kGt: deleted, back to 0");
+    require(sumCoverage(tree, 11) == 0, "kGt: deleted, back to 0");
 
     auto pLt = simple(pstree::Op::kLt, 10);
     tree.insertPredicate(pLt);
-    require(tree.matchPair(pstree::Int64Codec::encode(9))->predCounter == 1, "kLt: value below boundary included");
-    require(tree.matchPair(pstree::Int64Codec::encode(10))->predCounter == 0, "kLt: boundary value itself excluded");
-    require(tree.matchPair(pstree::Int64Codec::encode(11))->predCounter == 0, "kLt: value above boundary excluded");
+    require(sumCoverage(tree, 9) == 1, "kLt: value below boundary included");
+    require(sumCoverage(tree, 10) == 0, "kLt: boundary value itself excluded");
+    require(sumCoverage(tree, 11) == 0, "kLt: value above boundary excluded");
     tree.deletePredicate(pLt);
-    require(tree.matchPair(pstree::Int64Codec::encode(9))->predCounter == 0, "kLt: deleted, back to 0");
+    require(sumCoverage(tree, 9) == 0, "kLt: deleted, back to 0");
 }
 
 // kGt/kLt at adjacent integers should compose correctly with each other - ">9" covers
@@ -53,9 +63,9 @@ void test_strict_gt_lt_adjacent_composition() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     tree.insertPredicate(simple(pstree::Op::kGt, 9));  // covers >= 10
     tree.insertPredicate(simple(pstree::Op::kLt, 11)); // covers <= 10
-    require(tree.matchPair(pstree::Int64Codec::encode(10))->predCounter == 2, "value 10 covered by both >9 and <11");
-    require(tree.matchPair(pstree::Int64Codec::encode(9))->predCounter == 1, "value 9 covered by <11 only");
-    require(tree.matchPair(pstree::Int64Codec::encode(11))->predCounter == 1, "value 11 covered by >9 only");
+    require(sumCoverage(tree, 10) == 2, "value 10 covered by both >9 and <11");
+    require(sumCoverage(tree, 9) == 1, "value 9 covered by <11 only");
+    require(sumCoverage(tree, 11) == 1, "value 11 covered by >9 only");
 }
 
 // A kGt/kLt at the extreme representable value has no adjacent key to normalize to, and
@@ -65,32 +75,31 @@ void test_strict_gt_lt_domain_edge() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     auto pGtMax = simple(pstree::Op::kGt, std::numeric_limits<std::int64_t>::max());
     auto inserted = tree.insertPredicate(pGtMax);
-    require(inserted.empty(), "kGt at INT64_MAX should cover zero leaves (nothing is greater)");
-    require(tree.matchPair(pstree::Int64Codec::encode(std::numeric_limits<std::int64_t>::max()))->predCounter == 0,
+    require(inserted.empty(), "kGt at INT64_MAX should touch zero buckets (nothing is greater)");
+    require(sumCoverage(tree, std::numeric_limits<std::int64_t>::max()) == 0,
             "kGt at INT64_MAX: the max value itself still uncovered");
     // Deleting the same never-actually-inserted predicate must also be a safe no-op, not
     // an underflow - it recomputes the identical "no adjacent key" result deterministically.
     auto deleted = tree.deletePredicate(pGtMax);
-    require(deleted.empty(), "deleting a kGt-at-max predicate should also affect zero leaves");
+    require(deleted.empty(), "deleting a kGt-at-max predicate should also touch zero buckets");
 
     auto pLtMin = simple(pstree::Op::kLt, std::numeric_limits<std::int64_t>::min());
-    require(tree.insertPredicate(pLtMin).empty(), "kLt at INT64_MIN should cover zero leaves (nothing is smaller)");
-    require(tree.deletePredicate(pLtMin).empty(), "deleting a kLt-at-min predicate should also affect zero leaves");
+    require(tree.insertPredicate(pLtMin).empty(), "kLt at INT64_MIN should touch zero buckets (nothing is smaller)");
+    require(tree.deletePredicate(pLtMin).empty(), "deleting a kLt-at-min predicate should also touch zero buckets");
 }
 
 // Inserting the exact same predicate twice should double-count it (predCounter reaches 2),
-// and each delete should undo exactly one of the two insertions - this exercises
-// PartitionLeafNodeEqual's "boundary already exists" path repeatedly at the same point.
+// and each delete should undo exactly one of the two insertions.
 void test_duplicate_insert_delete() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     auto p = simple(pstree::Op::kEq, 42);
     tree.insertPredicate(p);
     tree.insertPredicate(p);
-    require(tree.matchPair(pstree::Int64Codec::encode(42))->predCounter == 2, "duplicate insert should reach counter 2");
+    require(sumCoverage(tree, 42) == 2, "duplicate insert should reach counter 2");
     tree.deletePredicate(p);
-    require(tree.matchPair(pstree::Int64Codec::encode(42))->predCounter == 1, "one delete should bring counter back to 1");
+    require(sumCoverage(tree, 42) == 1, "one delete should bring counter back to 1");
     tree.deletePredicate(p);
-    require(tree.matchPair(pstree::Int64Codec::encode(42))->predCounter == 0, "second delete should bring counter back to 0");
+    require(sumCoverage(tree, 42) == 0, "second delete should bring counter back to 0");
 }
 
 // Deleting a predicate that was never inserted (or deleting one twice) must fail loudly,
@@ -122,10 +131,12 @@ void test_delete_underflow_throws() {
 }
 
 // Many insert/delete cycles of overlapping ranges at the same points, run under a normal
-// build here and (separately, via CI/build-asan) under ASan+UBSan with leak detection -
-// this is the test most likely to expose a use-after-free or leak in the leaf-splitting/
-// copying logic, since it repeatedly creates and (partially) tears down the same region
-// of tree structure many times over.
+// build here and (separately, via CI/build-asan) under ASan+UBSan with leak detection - this
+// is the test most likely to expose a use-after-free or leak in the new marker-bucket
+// insert/delete paths, since it repeatedly creates the same region of tree structure many
+// times over (buckets are deliberately never freed on decrement - see ps_tree.hpp's own
+// file-level comment on why - so this also exercises that zero-counter "zombie" buckets stay
+// harmless across many cycles, not just one).
 void test_repeated_churn() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     for (int cycle = 0; cycle < 200; ++cycle) {
@@ -135,16 +146,15 @@ void test_repeated_churn() {
         b.vals1 = pstree::Int64Codec::encode(75);
         tree.insertPredicate(a);
         tree.insertPredicate(b);
-        require(tree.matchPair(pstree::Int64Codec::encode(30))->predCounter == 2, "churn cycle: overlap region covered twice");
+        require(sumCoverage(tree, 30) == 2, "churn cycle: overlap region covered twice");
         tree.deletePredicate(b);
         tree.deletePredicate(a);
-        require(tree.matchPair(pstree::Int64Codec::encode(30))->predCounter == 0, "churn cycle: back to zero after both deletes");
+        require(sumCoverage(tree, 30) == 0, "churn cycle: back to zero after both deletes");
     }
 }
 
-// Three overlapping ranges (not just two) stressing multiple simultaneous splits of the
-// same underlying leaf, and multiple simultaneous GetRNode/GetLNode alias-propagation
-// sites (see ps_tree.hpp's PartitionLeafNodeLeft fix) active at once.
+// Three overlapping ranges (not just two) stressing multiple simultaneous canonical
+// decompositions sharing common ancestor nodes.
 void test_three_way_overlap() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     auto a = simple(pstree::Op::kIn, 0);
@@ -157,32 +167,57 @@ void test_three_way_overlap() {
     tree.insertPredicate(b);
     tree.insertPredicate(c);
 
-    auto counterAt = [&](std::int64_t v) { return tree.matchPair(pstree::Int64Codec::encode(v))->predCounter; };
-    require(counterAt(5) == 1, "v=5 covered by A only");
-    require(counterAt(15) == 2, "v=15 covered by A and B");
-    require(counterAt(25) == 3, "v=25 covered by A, B, and C");
-    require(counterAt(35) == 2, "v=35 covered by B and C");
-    require(counterAt(45) == 1, "v=45 covered by C only");
-    require(counterAt(-5) == 0, "v=-5 covered by none");
-    require(counterAt(55) == 0, "v=55 covered by none");
+    require(sumCoverage(tree, 5) == 1, "v=5 covered by A only");
+    require(sumCoverage(tree, 15) == 2, "v=15 covered by A and B");
+    require(sumCoverage(tree, 25) == 3, "v=25 covered by A, B, and C");
+    require(sumCoverage(tree, 35) == 2, "v=35 covered by B and C");
+    require(sumCoverage(tree, 45) == 1, "v=45 covered by C only");
+    require(sumCoverage(tree, -5) == 0, "v=-5 covered by none");
+    require(sumCoverage(tree, 55) == 0, "v=55 covered by none");
 
     tree.deletePredicate(b);
-    require(counterAt(15) == 1, "after deleting B, v=15 covered by A only");
-    require(counterAt(25) == 2, "after deleting B, v=25 covered by A and C");
-    require(counterAt(35) == 1, "after deleting B, v=35 covered by C only");
+    require(sumCoverage(tree, 15) == 1, "after deleting B, v=15 covered by A only");
+    require(sumCoverage(tree, 25) == 2, "after deleting B, v=25 covered by A and C");
+    require(sumCoverage(tree, 35) == 1, "after deleting B, v=35 covered by C only");
 }
 
-// `in` with lo == hi is a valid single-point range, equivalent to `=` for matching
-// purposes (though it still goes through the two-endpoint kIn insertion path, not kEq's).
+// `in` with lo == hi is a valid single-point range, equivalent to `=` for matching purposes -
+// this is the REQUIRED base case in insertBetween/deleteBetween (see ps_tree.hpp's own
+// file-level comment: the general LCA decomposition has no defined "first level where lo/hi
+// diverge" when they're equal), not just a nice-to-have, so this is a direct regression test
+// for that specific base case.
 void test_in_with_equal_endpoints() {
     pstree::PSTree tree(pstree::Int64Codec::shape());
     auto p = simple(pstree::Op::kIn, 7);
     p.vals1 = pstree::Int64Codec::encode(7);
     auto leaves = tree.insertPredicate(p);
-    require(leaves.size() == 1, "in[7,7] should cover exactly one leaf");
-    require(tree.matchPair(pstree::Int64Codec::encode(7))->predCounter == 1, "in[7,7]: exact value included");
-    require(tree.matchPair(pstree::Int64Codec::encode(6))->predCounter == 0, "in[7,7]: value below excluded");
-    require(tree.matchPair(pstree::Int64Codec::encode(8))->predCounter == 0, "in[7,7]: value above excluded");
+    require(leaves.size() == 1, "in[7,7] should touch exactly one bucket (routed to the equality path)");
+    require(sumCoverage(tree, 7) == 1, "in[7,7]: exact value included");
+    require(sumCoverage(tree, 6) == 0, "in[7,7]: value below excluded");
+    require(sumCoverage(tree, 8) == 0, "in[7,7]: value above excluded");
+    tree.deletePredicate(p);
+    require(sumCoverage(tree, 7) == 0, "in[7,7]: deleted, back to 0");
+}
+
+// `in` where lo and hi diverge only at the LAST digit level - the other required base case
+// (see ps_tree.hpp's file-level comment: lcaLevel == depth-1 collapses to one bounded marker
+// at the lca node itself, since there's no deeper level to descend into for either branch).
+void test_in_diverging_at_last_level() {
+    pstree::PSTree tree(pstree::Int64Codec::shape());
+    // 100 and 103 share every digit except the last 4-bit chunk (both small positive
+    // integers, same sign/high bits, low nibble 100=0x64 vs 103=0x67 differs only in the
+    // last hex digit of the encoded key).
+    auto p = simple(pstree::Op::kIn, 100);
+    p.vals1 = pstree::Int64Codec::encode(103);
+    auto touched = tree.insertPredicate(p);
+    require(touched.size() == 1, "in[100,103] diverging only at the last level should touch exactly one bucket");
+    require(sumCoverage(tree, 99) == 0, "in[100,103]: value below excluded");
+    require(sumCoverage(tree, 100) == 1, "in[100,103]: lower boundary included");
+    require(sumCoverage(tree, 101) == 1, "in[100,103]: interior value included");
+    require(sumCoverage(tree, 103) == 1, "in[100,103]: upper boundary included");
+    require(sumCoverage(tree, 104) == 0, "in[100,103]: value above excluded");
+    tree.deletePredicate(p);
+    require(sumCoverage(tree, 101) == 0, "in[100,103]: deleted, back to 0");
 }
 
 } // namespace
@@ -196,6 +231,7 @@ int main() {
     test_repeated_churn();
     test_three_way_overlap();
     test_in_with_equal_endpoints();
+    test_in_diverging_at_last_level();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";
