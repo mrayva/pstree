@@ -230,9 +230,15 @@ public:
         DimensionIndex& dim = dimIt->second;
 
         // Stored BEFORE the leaf loop below, not after: reorganizeGroups() (triggered by
-        // growth mid-loop) looks up every currently-grouped subscription, including this
-        // one, via subscriptions_.at() - it must already be there.
-        subscriptions_.emplace(sub.id, sub);
+        // growth mid-loop) needs every currently-grouped subscription's own storage, including
+        // this one, already in place. `subPtr` points directly into this map's own element
+        // storage - safe to keep past this call and reuse from MatchEvent's hot loop below
+        // (see LeafGroupState::groups' own comment): unordered_map guarantees references/
+        // pointers to elements are never invalidated by insertion (only by erasing that same
+        // element, which DeleteSubscription always does only after removing every `ids` entry
+        // pointing at it - see there).
+        auto [subIt, subInserted] = subscriptions_.emplace(sub.id, sub);
+        const Subscription* subPtr = &subIt->second;
 
         std::vector<LeafNode*> leafNodes = applyToTree(dim, accPred, /*insert=*/true);
 
@@ -241,7 +247,7 @@ public:
         for (LeafNode* leaf : leafNodes) {
             LeafGroupState& state = groupStateFor(leaf);
             DimSig sig = calculateDimSig(subDims, state.dimSigLen);
-            state.groups[sig].push_back(sub.id);
+            state.groups[sig].emplace_back(sub.id, subPtr);
             state.subNum += 1;
             if (state.subNum >= detail::growThreshold(state.dimSigLen)) {
                 state.dimSigLen += 1;
@@ -276,9 +282,8 @@ public:
                 DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
                 for (auto& [groupSig, ids] : state.groups) {
                     if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
-                    for (auto id : ids) {
-                        const Subscription& sub = subscriptions_.at(id);
-                        if (matchSubscription(event, sub)) {
+                    for (auto& [id, subPtr] : ids) {
+                        if (matchSubscription(event, *subPtr)) {
                             matchingSubs.push_back(id);
                         }
                     }
@@ -315,7 +320,8 @@ public:
                 throw std::logic_error("pstree: subscription's group missing on delete - insert/delete bookkeeping bug");
             }
             auto& ids = groupIt->second;
-            auto idIt = std::find(ids.begin(), ids.end(), subId);
+            auto idIt = std::find_if(ids.begin(), ids.end(),
+                                      [subId](const auto& entry) { return entry.first == subId; });
             if (idIt == ids.end()) {
                 throw std::logic_error("pstree: subscription id missing from its own group on delete");
             }
@@ -347,7 +353,17 @@ private:
     struct LeafGroupState {
         std::size_t dimSigLen = detail::kInitialDimSigLen;
         std::size_t subNum = 0;
-        std::unordered_map<DimSig, std::vector<std::uint64_t>, DimSig::Hasher> groups;
+        // Each entry pairs a subscription's id (needed only for MatchEvent's own returned
+        // result list) with a POINTER directly into subscriptions_'s own element storage -
+        // deliberately not just an id, to avoid an unordered_map::at(id) hash lookup for every
+        // single candidate MatchEvent's innermost loop visits. Confirmed via `perf annotate` to
+        // matter in practice: that lookup was ~63% of MatchEvent's own self-time on a
+        // many-thousand-subscription workload before this change (see nats_sidecar's own
+        // matching-engine benchmark/README). Safe because unordered_map never invalidates
+        // references/pointers to an element except by erasing that exact element - see
+        // InsertSubscription's and DeleteSubscription's own comments for why the ordering
+        // guarantees a pointer is never read here after its target is erased.
+        std::unordered_map<DimSig, std::vector<std::pair<std::uint64_t, const Subscription*>>, DimSig::Hasher> groups;
     };
 
     static void destroyLeafGroupState(void* p) { delete static_cast<LeafGroupState*>(p); }
@@ -449,15 +465,14 @@ private:
     // (ReorganizeGroups is referenced by name only) - this is the natural, only-sensible
     // implementation of what it must do given the rest of Algorithm 4/6's own description.
     void reorganizeGroups(LeafGroupState& state) {
-        std::vector<std::uint64_t> allSubs;
+        std::vector<std::pair<std::uint64_t, const Subscription*>> allSubs;
         for (auto& [sig, ids] : state.groups) {
             allSubs.insert(allSubs.end(), ids.begin(), ids.end());
         }
         state.groups.clear();
-        for (auto id : allSubs) {
-            const Subscription& sub = subscriptions_.at(id);
-            DimSig sig = calculateDimSig(detail::dimSigDimensions(sub), state.dimSigLen);
-            state.groups[sig].push_back(id);
+        for (auto& [id, subPtr] : allSubs) {
+            DimSig sig = calculateDimSig(detail::dimSigDimensions(*subPtr), state.dimSigLen);
+            state.groups[sig].emplace_back(id, subPtr);
         }
     }
 
