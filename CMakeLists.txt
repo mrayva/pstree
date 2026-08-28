@@ -40,6 +40,7 @@ set(PSTREE_UNIT_TESTS
     test_edge_cases
     test_random_stress
     test_predicate
+    test_predicate_list
     test_dim_sig
     test_pst_dynamic
     test_pst_dynamic_stress
