@@ -17,6 +17,20 @@ existing codebase.
 (`engine: pstree`) - see that repo's own README.md for the operator-support/limitations summary.
 PSTParallel (Phase 4) remains deliberately not started.
 
+**Independent benchmark against a-tree/be-tree (`nats_sidecar`'s `benchmarks/matching_engine_bench.cpp`,
+see that repo's README for the full writeup and numbers) found a real, architectural scaling
+limitation, not a bug**: `PSTDynamic::insertSubscription()` must attach a subscription to *every
+leaf* its access predicate's range covers (required for `MatchEvent`'s O(1) per-event lookup
+contract to hold), which is cheap for an equality/narrow-range access predicate but degrades toward
+O(leaf-count) per insertion - and O(group-size) per matching event - when a subscription's *only*
+available predicate is a wide, unbounded comparison (`price > X`) and many such subscriptions with
+independent thresholds share a dimension. Measured: at K=10,000 synthetic subscriptions (30% of
+which are exactly this shape), pstree's insert rate falls to ~1.4% of a-tree's and its search rate
+to ~15% of a-tree's - a real, growing-with-K disadvantage, not a fixed constant-factor gap. This
+doesn't contradict the paper's own results (likely measured on workloads with narrower/bounded
+access predicates) but does mean PSTDynamic as implemented here isn't a good fit for a workload
+dominated by independent wide-range "threshold alert" subscriptions.
+
 **Phase 1 complete**: the PS-Tree index itself (Algorithms 1-3 - `InsertPredicate`, `MatchPair`,
 `DeletePredicate`), including strict `>`/`<` support, domain-boundary edge cases, and a randomized
 property-based stress test (checked against a brute-force oracle across dozens of seeds and
