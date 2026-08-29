@@ -292,6 +292,38 @@ inline const Value* findAttr(const Event& event, std::string_view attr) {
     return nullptr;
 }
 
+// Compares two Values without going through std::variant's own operator==/<=> - both route
+// through std::visit's type-erased double-dispatch (a vtable-style indirect call per
+// comparison), which `perf` showed dominating matchValue's own self-time at scale even AFTER
+// switching kElemOf/kNotElemOf from a linear scan to a binary_search (binary_search does far
+// fewer comparisons, but each one was still paying std::visit's overhead - see git history
+// for the profile that caught this). Index-then-std::get is a plain integer switch plus one
+// monomorphic, statically-typed comparison per branch - trivially inlinable, no
+// visitor-table/indirect-call machinery involved at all. Used for every comparison-shaped
+// operator below, not just kElemOf/kNotElemOf's sort/binary_search, for the same reason and
+// the same win (untested in THIS project's own benchmark, which is kElemOf-only, but no
+// reason the other operators wouldn't pay the identical std::visit tax on any real workload
+// that uses them).
+inline bool valueEqual(const Value& a, const Value& b) {
+    if (a.index() != b.index()) return false;
+    switch (a.index()) {
+        case 0: return std::get<bool>(a) == std::get<bool>(b);
+        case 1: return std::get<std::int64_t>(a) == std::get<std::int64_t>(b);
+        case 2: return std::get<double>(a) == std::get<double>(b);
+        default: return std::get<std::string>(a) == std::get<std::string>(b);
+    }
+}
+
+inline bool valueLess(const Value& a, const Value& b) {
+    if (a.index() != b.index()) return a.index() < b.index();
+    switch (a.index()) {
+        case 0: return std::get<bool>(a) < std::get<bool>(b);
+        case 1: return std::get<std::int64_t>(a) < std::get<std::int64_t>(b);
+        case 2: return std::get<double>(a) < std::get<double>(b);
+        default: return std::get<std::string>(a) < std::get<std::string>(b);
+    }
+}
+
 // Evaluates one predicate against one concrete value. Throws if `val` and `pred`'s own
 // value(s) aren't the same variant alternative - a schema/caller bug (mixing types for the
 // same attribute), not a matching outcome, so it's surfaced loudly rather than silently
@@ -311,48 +343,46 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
     switch (pred.op) {
         case CmpOp::kLt:
             checkSameType(pred.vals.at(0));
-            return val < pred.vals[0];
+            return valueLess(val, pred.vals[0]);
         case CmpOp::kLe:
             checkSameType(pred.vals.at(0));
-            return val <= pred.vals[0];
+            return !valueLess(pred.vals[0], val);
         case CmpOp::kEq:
             checkSameType(pred.vals.at(0));
-            return val == pred.vals[0];
+            return valueEqual(val, pred.vals[0]);
         case CmpOp::kNe:
             checkSameType(pred.vals.at(0));
-            return !(val == pred.vals[0]);
+            return !valueEqual(val, pred.vals[0]);
         case CmpOp::kGt:
             checkSameType(pred.vals.at(0));
-            return val > pred.vals[0];
+            return valueLess(pred.vals[0], val);
         case CmpOp::kGe:
             checkSameType(pred.vals.at(0));
-            return val >= pred.vals[0];
+            return !valueLess(val, pred.vals[0]);
         case CmpOp::kBetween:
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
-            return val >= pred.vals[0] && val <= pred.vals[1];
+            return !valueLess(val, pred.vals[0]) && !valueLess(pred.vals[1], val);
         // Sorts pred.vals (see its own field comment) and binary_searches it instead of a
-        // linear std::variant::operator== scan - real values lists here run up to ~128
-        // elements (e.g. a `symbol in (...)` set-membership subscription), and the linear
-        // scan's per-element std::variant comparison (std::visit's type-erased double
-        // dispatch) was measured via `perf` to dominate matchValue's own self-time at scale.
-        // The one-time sort (and its exhaustive type check, preserving the original
-        // per-element checkSameType behavior exactly once rather than on every match) is
-        // amortized over every subsequent search against this same predicate.
+        // linear scan - real values lists here run up to ~128 elements (e.g. a
+        // `symbol in (...)` set-membership subscription). The one-time sort (and its
+        // exhaustive type check, preserving the original per-element checkSameType behavior
+        // exactly once rather than on every match) is amortized over every subsequent search
+        // against this same predicate.
         case CmpOp::kElemOf:
             if (!pred.elemOfSorted) {
                 for (const auto& v : pred.vals) checkSameType(v);
-                std::sort(pred.vals.begin(), pred.vals.end());
+                std::sort(pred.vals.begin(), pred.vals.end(), valueLess);
                 pred.elemOfSorted = true;
             }
-            return std::binary_search(pred.vals.begin(), pred.vals.end(), val);
+            return std::binary_search(pred.vals.begin(), pred.vals.end(), val, valueLess);
         case CmpOp::kNotElemOf:
             if (!pred.elemOfSorted) {
                 for (const auto& v : pred.vals) checkSameType(v);
-                std::sort(pred.vals.begin(), pred.vals.end());
+                std::sort(pred.vals.begin(), pred.vals.end(), valueLess);
                 pred.elemOfSorted = true;
             }
-            return !std::binary_search(pred.vals.begin(), pred.vals.end(), val);
+            return !std::binary_search(pred.vals.begin(), pred.vals.end(), val, valueLess);
         case CmpOp::kIsNull:
         case CmpOp::kIsNotNull:
             throw std::logic_error("pstree: kIsNull/kIsNotNull must be intercepted by matchSubscription, never reach matchValue");
