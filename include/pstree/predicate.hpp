@@ -13,6 +13,7 @@
 // every predicate (including the access predicate itself, re-checked) is evaluated here via
 // Match() for the final per-subscription confirmation (Algorithm 5, line 11).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -64,7 +65,17 @@ using Value = std::variant<bool, std::int64_t, double, std::string>;
 struct SubPredicate {
     std::string attr;
     CmpOp op;
-    std::vector<Value> vals; // size 1 for most ops, 2 for kBetween, >=1 for kElemOf/kNotElemOf
+    // mutable: matchValue() lazily sorts this in place (once, on the first kElemOf/kNotElemOf
+    // match - see matchValue()'s own comment) so it can binary_search a large value list
+    // instead of a linear scan. The SET of values a predicate holds never changes this way,
+    // only their storage order - safe regardless of when it happens relative to insertion:
+    // pst_dynamic.hpp's own buildLowLevel() (kElemOf's index-construction path) already
+    // consumes these order-independently (a plain set union via a `for (auto& v : pred.vals)`
+    // loop), and kBetween/kEq/etc's own single- or positional-index accesses (vals.at(0),
+    // vals.at(1) for kBetween's [lo,hi]) are untouched since only kElemOf/kNotElemOf ever get
+    // sorted.
+    mutable std::vector<Value> vals; // size 1 for most ops, 2 for kBetween, >=1 for kElemOf/kNotElemOf
+    mutable bool elemOfSorted = false; // set once `vals` has been sorted for kElemOf/kNotElemOf
 };
 
 // Small-vector-optimized storage for a subscription's predicates: real subscriptions almost
@@ -320,18 +331,28 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
             return val >= pred.vals[0] && val <= pred.vals[1];
+        // Sorts pred.vals (see its own field comment) and binary_searches it instead of a
+        // linear std::variant::operator== scan - real values lists here run up to ~128
+        // elements (e.g. a `symbol in (...)` set-membership subscription), and the linear
+        // scan's per-element std::variant comparison (std::visit's type-erased double
+        // dispatch) was measured via `perf` to dominate matchValue's own self-time at scale.
+        // The one-time sort (and its exhaustive type check, preserving the original
+        // per-element checkSameType behavior exactly once rather than on every match) is
+        // amortized over every subsequent search against this same predicate.
         case CmpOp::kElemOf:
-            for (const auto& v : pred.vals) {
-                checkSameType(v);
-                if (val == v) return true;
+            if (!pred.elemOfSorted) {
+                for (const auto& v : pred.vals) checkSameType(v);
+                std::sort(pred.vals.begin(), pred.vals.end());
+                pred.elemOfSorted = true;
             }
-            return false;
+            return std::binary_search(pred.vals.begin(), pred.vals.end(), val);
         case CmpOp::kNotElemOf:
-            for (const auto& v : pred.vals) {
-                checkSameType(v);
-                if (val == v) return false;
+            if (!pred.elemOfSorted) {
+                for (const auto& v : pred.vals) checkSameType(v);
+                std::sort(pred.vals.begin(), pred.vals.end());
+                pred.elemOfSorted = true;
             }
-            return true;
+            return !std::binary_search(pred.vals.begin(), pred.vals.end(), val);
         case CmpOp::kIsNull:
         case CmpOp::kIsNotNull:
             throw std::logic_error("pstree: kIsNull/kIsNotNull must be intercepted by matchSubscription, never reach matchValue");

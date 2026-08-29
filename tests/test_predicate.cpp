@@ -58,6 +58,32 @@ void test_elem_of_and_not_elem_of() {
     require(pstree::matchValue(pstree::Value(std::string("z")), pNot), "'z' satisfies not-elem-of {a,b,c}");
 }
 
+// Regression test: matchValue() lazily sorts a kElemOf/kNotElemOf predicate's vals in place
+// (once) so it can binary_search instead of a linear scan (see SubPredicate's own field
+// comment and matchValue()'s kElemOf/kNotElemOf case comment in predicate.hpp) - the OTHER
+// test above happens to use an already-alphabetically-sorted input list ({a,b,c}), which
+// would pass even with a broken sort/binary_search pairing. This one uses a deliberately
+// scrambled, larger list (including a repeated value and mixed-magnitude integers, not just
+// alphabetically-orderable strings) and calls matchValue() many times against the SAME
+// SubPredicate object (mirroring the real reuse-across-many-events pattern) to also exercise
+// the "already sorted from a prior call" branch, not just the first-call sort path.
+void test_elem_of_with_unsorted_input_and_repeated_calls() {
+    using pstree::CmpOp;
+    auto p = pred("port", CmpOp::kElemOf,
+                   {std::int64_t{80}, std::int64_t{22}, std::int64_t{443}, std::int64_t{22},
+                    std::int64_t{8080}, std::int64_t{1}});
+    require(pstree::matchValue(pstree::Value(std::int64_t{22}), p), "22 elem of scrambled {80,22,443,22,8080,1} (1st call)");
+    require(pstree::matchValue(pstree::Value(std::int64_t{1}), p), "1 elem of scrambled list (2nd call, already sorted)");
+    require(pstree::matchValue(pstree::Value(std::int64_t{8080}), p), "8080 elem of scrambled list (3rd call)");
+    require(!pstree::matchValue(pstree::Value(std::int64_t{9999}), p), "9999 not elem of scrambled list");
+
+    auto pNot = pred("port", CmpOp::kNotElemOf,
+                      {std::int64_t{80}, std::int64_t{22}, std::int64_t{443}, std::int64_t{22},
+                       std::int64_t{8080}, std::int64_t{1}});
+    require(!pstree::matchValue(pstree::Value(std::int64_t{443}), pNot), "443 fails not-elem-of scrambled list");
+    require(pstree::matchValue(pstree::Value(std::int64_t{9999}), pNot), "9999 satisfies not-elem-of scrambled list (repeat call)");
+}
+
 void test_bool_and_double() {
     using pstree::CmpOp;
     require(pstree::matchValue(pstree::Value(true), pred("flag", CmpOp::kEq, {true})), "true == true");
@@ -133,6 +159,7 @@ int main() {
     test_relational_operators_int();
     test_between();
     test_elem_of_and_not_elem_of();
+    test_elem_of_with_unsorted_input_and_repeated_calls();
     test_bool_and_double();
     test_type_mismatch_throws();
     test_missing_attribute_fails_subscription();
