@@ -38,6 +38,13 @@ std::vector<Dim> makeDims() {
         {"f0", pstree::ValueType::kFloat}, {"f1", pstree::ValueType::kFloat},
         {"b0", pstree::ValueType::kBoolean},
         {"s0", pstree::ValueType::kString}, {"s1", pstree::ValueType::kString},
+        // Deliberately skewed-cardinality pair (s_narrow: 5 real values, s_wide: 100) - mirrors
+        // the shape of a real bug found via a downstream benchmark (see pst_dynamic.hpp's own
+        // file-level comment): a subscription with kElemOf predicates on BOTH of these should
+        // let selectAccPredIndex()'s observed-cardinality tie-break get meaningfully exercised
+        // by this test's randomized insert/delete/match differential checking, not just by the
+        // one hand-crafted regression test in test_pst_dynamic.cpp.
+        {"s_narrow", pstree::ValueType::kString}, {"s_wide", pstree::ValueType::kString},
     };
 }
 
@@ -62,6 +69,12 @@ pstree::Value randomValue(const Dim& dim, std::mt19937& rng) {
             return pstree::Value(d(rng) == 1);
         }
         case pstree::ValueType::kString: {
+            if (dim.name == "s_wide") {
+                // 100 distinct values (vs. the 5-word pool everything else uses below) - see
+                // makeDims()'s own comment for why this deliberately skewed pair exists.
+                std::uniform_int_distribution<int> wd(0, 99);
+                return pstree::Value("w" + std::to_string(wd(rng)));
+            }
             std::uniform_int_distribution<int> d(0, 4);
             static const char* words[] = {"aa", "bb", "cc", "dd", "ee"};
             return pstree::Value(std::string(words[d(rng)]));

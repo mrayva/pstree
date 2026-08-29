@@ -12,12 +12,37 @@
 // comment for the Bloom filter itself):
 //   - SelectAccPred uses the paper's own static selectivity ranking (Section 2.3:
 //     "{=} > {in} > {in} > {<,<=,>,>=} > {!in} > {!=}" - i.e. kEq > kElemOf > kBetween >
-//     {kLt,kLe,kGt,kGe} > kNotElemOf > kNe), with narrower value width as a tie-break within
-//     the same tier, and first-in-subscription-order as the final tie-break - a pure,
-//     deterministic function of the subscription alone (required: DeleteSubscription must
-//     reselect the identical access predicate InsertSubscription chose). Verified against
-//     Fig. 3's own 6 subscriptions: this heuristic picks exactly the access predicates the
-//     paper states it does for every one of them (see test_pst_dynamic.cpp).
+//     {kLt,kLe,kGt,kGe} > kNotElemOf > kNe) as the primary key. Verified against Fig. 3's own
+//     6 subscriptions: this ranking alone picks exactly the access predicates the paper
+//     states it does for every one of them (see test_pst_dynamic.cpp) - none of Fig. 3's
+//     subscriptions have two same-tier predicates, so the tie-break below is never consulted
+//     there.
+//   - Within the same tier, kElemOf/kNotElemOf break ties by real-world SELECTIVITY, not raw
+//     value-list width: `vals.size() / observedValues.size()` for the predicate's own
+//     dimension (see DimensionIndex::observedValues), smaller wins. A real, measured bug in
+//     the paper's own literal "narrower list wins" heuristic: it conflates "few literals" with
+//     "selective," which only holds when every candidate dimension has a similarly-sized real
+//     domain. A subscription like `exchange in (1-4 values)` (a 19-value real domain) vs.
+//     `symbol in (8-128 values)` (a ~12,000-value real domain) in the SAME subscription always
+//     picked `exchange` under the old raw-width rule - indexing on a 19-value domain gives
+//     almost no partitioning once subscription counts reach into the thousands, since nearly
+//     every subscription becomes a per-event candidate regardless of which exchange value the
+//     event carries. Normalizing by each dimension's own observed cardinality picks `symbol`
+//     instead once enough data has been seen, since it covers a far smaller FRACTION of its
+//     own (much larger) domain - measured on a real downstream benchmark
+//     (nats_sidecar's K=4000-32000 exchange/symbol set-membership benchmark) at 70-135x
+//     higher search throughput. `kBetween`'s own numeric-range width tie-break is untouched -
+//     no comparable bug found there, not touched.
+//   - Because of the above, SelectAccPred is NO LONGER a pure, time-invariant function of the
+//     subscription alone - `observedValues` grows as more subscriptions are inserted, so the
+//     SAME subscription could select a different access predicate depending on insertion
+//     order. This is fine for correctness (which predicate ends up "the" access predicate is
+//     an internal indexing choice, not an observable one) but breaks the OLD invariant this
+//     comment used to state ("DeleteSubscription must reselect the identical access predicate
+//     InsertSubscription chose" via a second, later call to the same pure function) - fixed by
+//     no longer recomputing at delete time at all: the selected index is computed once, at
+//     insert time, and stored alongside the subscription (see `subscriptions_`'s value type)
+//     for DeleteSubscription to read back directly.
 //   - grow/shrinkThreshold: the paper's own Algorithm 4/6 pseudocode reuses ONE
 //     `thresholds[DimSigLen]` array for BOTH the grow check (Algorithm 4, line 8:
 //     `subNum >= thresholds[DimSigLen]`) and the shrink check (Algorithm 6, line 8:
@@ -51,6 +76,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pstree/dim_sig.hpp"
@@ -118,11 +144,25 @@ inline int opRank(CmpOp op) {
     return 6;
 }
 
-// Smaller = more selective (narrower). Only meaningful within the same rank tier (Section
-// 2.3: "When the operators have the same values, we consider predicates with wider value
-// sets to have lower selectivity"). Operators with no natural width always return 0 (a tie,
-// falling through to subscription order).
-inline double widthTieBreak(const SubPredicate& p) {
+// Smaller = more selective. Only meaningful within the same rank tier (Section 2.3: "When
+// the operators have the same values, we consider predicates with wider value sets to have
+// lower selectivity"). Operators with no natural width always return 0 (a tie, falling
+// through to subscription order).
+//
+// kElemOf/kNotElemOf's own case is normalized by `domainCardinality` - the number of DISTINCT
+// values ever observed for this predicate's dimension, across every subscription inserted so
+// far (see DimensionIndex::observedValues, fed by PSTDynamic::insertSubscription; the caller,
+// PSTDynamic::selectAccPredIndex, looks this up and passes it in - kept out of this function
+// so it stays a plain, dependency-free comparison helper). A real, measured bug in the
+// paper's own literal "narrower list wins" rule: raw list width alone conflates "few
+// literals" with "selective," which only holds when every candidate dimension has a
+// similarly-sized real domain - see pst_dynamic.hpp's own file-level comment for the exact
+// scenario (a low-cardinality dimension's narrow list always "winning" over a
+// high-cardinality dimension's wider one, even though indexing on the low-cardinality one
+// gives almost no partitioning at scale) and the measured fix (70-135x higher search
+// throughput on a real downstream benchmark once corrected). `domainCardinality` is ignored
+// for every other operator, including kBetween's own separate numeric-range width tie-break.
+inline double widthTieBreak(const SubPredicate& p, std::size_t domainCardinality) {
     switch (p.op) {
         case CmpOp::kBetween:
             if (p.vals.size() == 2 && std::holds_alternative<std::int64_t>(p.vals[0]) &&
@@ -136,7 +176,8 @@ inline double widthTieBreak(const SubPredicate& p) {
             return 0.0;
         case CmpOp::kElemOf:
         case CmpOp::kNotElemOf:
-            return static_cast<double>(p.vals.size());
+            return static_cast<double>(p.vals.size()) /
+                   static_cast<double>(std::max<std::size_t>(domainCardinality, 1));
         default:
             return 0.0;
     }
@@ -174,38 +215,11 @@ inline std::vector<std::string> dimSigDimensions(const Subscription& sub) {
 
 } // namespace detail
 
-// Deterministic access-predicate selection (Section 2.3's static heuristic - see
-// file-level comment). Same function used by both InsertSubscription and
-// DeleteSubscription, so a subscription's access predicate never changes across its
-// lifetime.
-inline std::size_t selectAccPredIndex(const Subscription& sub) {
-    if (sub.predicates.empty()) {
-        throw std::invalid_argument("pstree: subscription " + std::to_string(sub.id) + " has no predicates");
-    }
-    std::size_t best = 0;
-    for (std::size_t i = 1; i < sub.predicates.size(); ++i) {
-        int rankBest = detail::opRank(sub.predicates[best].op);
-        int rankI = detail::opRank(sub.predicates[i].op);
-        bool better = rankI < rankBest ||
-            (rankI == rankBest && detail::widthTieBreak(sub.predicates[i]) < detail::widthTieBreak(sub.predicates[best]));
-        if (better) best = i;
-    }
-    // kIsNull ranks worst specifically so it's only ever chosen when nothing else is
-    // available (see opRank) - and when that happens, the subscription genuinely can't be
-    // indexed at all: "X is null" only matches events where X is absent, but MatchEvent
-    // never consults X's own dimension tree for such events in the first place (there's no
-    // pair to route through). Caught here, at selection time, with a clear message - not
-    // silently left to produce a subscription that can never match anything.
-    if (sub.predicates[best].op == CmpOp::kIsNull) {
-        throw std::invalid_argument(
-            "pstree: subscription " + std::to_string(sub.id) +
-            " cannot be indexed - its best available access predicate is 'is null' on '" +
-            sub.predicates[best].attr +
-            "', which has no representable PS-Tree range (add at least one other, "
-            "indexable predicate to this subscription)");
-    }
-    return best;
-}
+// selectAccPredIndex (Section 2.3's static heuristic, plus the observed-cardinality
+// correction described in the file-level comment) lives as a private member function of
+// PSTDynamic, not a free function here - it needs `dimensions_` to look up each candidate
+// predicate's observed cardinality, which a free function in this position can't reach
+// (DimensionIndex is a private nested type). See PSTDynamic::selectAccPredIndex below.
 
 class PSTDynamic {
 public:
@@ -216,11 +230,77 @@ public:
         }
     }
 
+    // Section 2.3's static heuristic (operator-tier ranking), plus an observed-cardinality
+    // correction within the kElemOf/kNotElemOf tier - see the file-level comment for the full
+    // rationale and the measured real-world win. Public (not just an internal implementation
+    // detail of InsertSubscription): side-effect-free given a subscription, and useful on its
+    // own for a caller wanting to know which predicate would be chosen (e.g. testing - see
+    // test_pst_dynamic.cpp's own Fig. 3 reproduction - or diagnostics/tuning).
+    //
+    // No longer a pure, time-invariant function of the subscription alone: `observedValues`
+    // (below) changes as more subscriptions are inserted, so calling this twice for the same
+    // subscription at two different points in time could return different answers. Called
+    // EXACTLY ONCE per subscription by InsertSubscription itself - the result is stored in
+    // StoredSubscription::accIdx and read back directly by DeleteSubscription, never
+    // recomputed - so this method being callable repeatedly (e.g. from a test) never risks
+    // insert/delete disagreeing about which predicate a given subscription actually used.
+    std::size_t selectAccPredIndex(const Subscription& sub) const {
+        if (sub.predicates.empty()) {
+            throw std::invalid_argument("pstree: subscription " + std::to_string(sub.id) + " has no predicates");
+        }
+        auto cardinalityFor = [&](const SubPredicate& p) -> std::size_t {
+            auto it = dimensions_.find(p.attr);
+            return it == dimensions_.end() ? 0 : it->second.observedValues.size();
+        };
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < sub.predicates.size(); ++i) {
+            int rankBest = detail::opRank(sub.predicates[best].op);
+            int rankI = detail::opRank(sub.predicates[i].op);
+            bool better = rankI < rankBest ||
+                (rankI == rankBest &&
+                 detail::widthTieBreak(sub.predicates[i], cardinalityFor(sub.predicates[i])) <
+                 detail::widthTieBreak(sub.predicates[best], cardinalityFor(sub.predicates[best])));
+            if (better) best = i;
+        }
+        // kIsNull ranks worst specifically so it's only ever chosen when nothing else is
+        // available (see opRank) - and when that happens, the subscription genuinely can't be
+        // indexed at all: "X is null" only matches events where X is absent, but MatchEvent
+        // never consults X's own dimension tree for such events in the first place (there's no
+        // pair to route through). Caught here, at selection time, with a clear message - not
+        // silently left to produce a subscription that can never match anything.
+        if (sub.predicates[best].op == CmpOp::kIsNull) {
+            throw std::invalid_argument(
+                "pstree: subscription " + std::to_string(sub.id) +
+                " cannot be indexed - its best available access predicate is 'is null' on '" +
+                sub.predicates[best].attr +
+                "', which has no representable PS-Tree range (add at least one other, "
+                "indexable predicate to this subscription)");
+        }
+        return best;
+    }
+
     // Algorithm 4, InsertSubscription.
     void insertSubscription(const Subscription& sub) {
         if (subscriptions_.count(sub.id) != 0) {
             throw std::invalid_argument("pstree: subscription id " + std::to_string(sub.id) + " already exists");
         }
+
+        // Feed every predicate's own literal values into its dimension's observed-cardinality
+        // tracker BEFORE selecting this subscription's own access predicate (see
+        // DimensionIndex::observedValues and selectAccPredIndex's own comment) - including
+        // predicates that DON'T end up chosen as the access predicate, so a wide-domain
+        // dimension's true cardinality becomes visible even from subscriptions that (correctly)
+        // keep preferring some other, still-more-selective predicate. Without this, a dimension
+        // nothing has ever been indexed ON would never accumulate the evidence needed to
+        // eventually win a tie-break against a narrower-but-lower-cardinality one.
+        for (const auto& pred : sub.predicates) {
+            auto predDimIt = dimensions_.find(pred.attr);
+            if (predDimIt == dimensions_.end()) continue; // unknown dimension - rejected below if selected
+            for (const auto& v : pred.vals) {
+                predDimIt->second.observedValues.insert(detail::encodeValue(v, predDimIt->second.schema));
+            }
+        }
+
         std::size_t accIdx = selectAccPredIndex(sub);
         const SubPredicate& accPred = sub.predicates.at(accIdx);
         auto dimIt = dimensions_.find(accPred.attr);
@@ -236,9 +316,12 @@ public:
         // (see LeafGroupState::groups' own comment): unordered_map guarantees references/
         // pointers to elements are never invalidated by insertion (only by erasing that same
         // element, which DeleteSubscription always does only after removing every `ids` entry
-        // pointing at it - see there).
-        auto [subIt, subInserted] = subscriptions_.emplace(sub.id, sub);
-        const Subscription* subPtr = &subIt->second;
+        // pointing at it - see there). `accIdx` is stored alongside the subscription, not
+        // recomputed later, so DeleteSubscription reads back exactly what was chosen here even
+        // though `observedValues` keeps changing afterward - see selectAccPredIndex's own
+        // comment and the file-level comment for why recomputing at delete time would be wrong.
+        auto [subIt, subInserted] = subscriptions_.emplace(sub.id, StoredSubscription{sub, accIdx});
+        const Subscription* subPtr = &subIt->second.sub;
 
         auto lowLevel = buildLowLevel(dim, accPred);
         std::vector<LeafNode*> leafNodes = applyLowLevel(dim, lowLevel, /*insert=*/true);
@@ -300,9 +383,12 @@ public:
         if (subIt == subscriptions_.end()) {
             throw std::invalid_argument("pstree: deleting unknown subscription id " + std::to_string(subId));
         }
-        const Subscription sub = subIt->second; // copy - erased from subscriptions_ before returning
-
-        std::size_t accIdx = selectAccPredIndex(sub);
+        const Subscription sub = subIt->second.sub; // copy - erased from subscriptions_ before returning
+        // Read back the index InsertSubscription chose and stored, rather than recomputing via
+        // selectAccPredIndex() - see that function's own comment for why recomputing here could
+        // now pick a DIFFERENT predicate than insert time did (observedValues keeps changing as
+        // more subscriptions are inserted in between).
+        std::size_t accIdx = subIt->second.accIdx;
         const SubPredicate& accPred = sub.predicates.at(accIdx);
         DimensionIndex& dim = dimensions_.at(accPred.attr);
 
@@ -385,6 +471,23 @@ private:
             : schema(std::move(s)), tree(detail::shapeFor(schema), destroyLeafGroupState) {}
         AttrSchema schema;
         PSTree tree;
+        // Distinct literal values ever referenced by ANY predicate on this dimension, across
+        // every subscription ever inserted (see insertSubscription's own comment for why - not
+        // just chosen access predicates) - used by selectAccPredIndex to normalize the
+        // kElemOf/kNotElemOf width tie-break by real domain cardinality instead of raw list
+        // width alone. Grows monotonically, never cleared on delete: "how diverse has this
+        // dimension's real data ever looked" is a lifetime signal, not a live-population count,
+        // and real attribute domains are finite in practice (same assumption the rest of this
+        // codebase already makes about domains being bounded).
+        std::unordered_set<ElementKey, ElementKey::Hasher> observedValues;
+    };
+
+    // Subscription storage, paired with the access-predicate index InsertSubscription chose for
+    // it - see selectAccPredIndex's own comment for why this must be computed once and
+    // remembered, not recomputed at delete time.
+    struct StoredSubscription {
+        Subscription sub;
+        std::size_t accIdx;
     };
 
     // Returns this leaf's LeafGroupState, allocating one on first touch.
@@ -496,7 +599,7 @@ private:
     }
 
     std::unordered_map<std::string, DimensionIndex> dimensions_;
-    std::unordered_map<std::uint64_t, Subscription> subscriptions_;
+    std::unordered_map<std::uint64_t, StoredSubscription> subscriptions_;
 };
 
 } // namespace pstree

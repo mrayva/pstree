@@ -61,15 +61,134 @@ std::vector<pstree::Subscription> fig3Subscriptions() {
 // predicate, while for S5 and S6, {attr1,=,2} and {attr3,=,6} are selected as the access
 // predicate" (page 17 prose) - verified against selectAccPredIndex() directly, proving the
 // static selectivity heuristic reproduces the paper's own stated choices exactly, not just
-// SOME plausible-looking choice.
+// SOME plausible-looking choice. selectAccPredIndex is now a PSTDynamic member (it needs
+// per-dimension observed-cardinality state - see pst_dynamic.hpp's own comment) rather than a
+// free function, but a fresh instance's own cardinality tracker is empty either way: none of
+// Fig. 3's subscriptions have two same-tier predicates (kEq/kBetween/kLt/kGt are all
+// different tiers here), so opRank alone decides for every one of them regardless - this test
+// is unaffected by the cardinality-aware tie-break change.
 void test_select_acc_pred_matches_paper() {
+    pstree::PSTDynamic pstd(fig3Schema());
     auto subs = fig3Subscriptions();
-    require(subs[0].predicates[pstree::selectAccPredIndex(subs[0])].attr == "attr2", "S1 access predicate should be on attr2");
-    require(subs[1].predicates[pstree::selectAccPredIndex(subs[1])].attr == "attr2", "S2 access predicate should be on attr2");
-    require(subs[2].predicates[pstree::selectAccPredIndex(subs[2])].attr == "attr2", "S3 access predicate should be on attr2");
-    require(subs[3].predicates[pstree::selectAccPredIndex(subs[3])].attr == "attr2", "S4 access predicate should be on attr2");
-    require(subs[4].predicates[pstree::selectAccPredIndex(subs[4])].attr == "attr1", "S5 access predicate should be on attr1 (the '=' predicate)");
-    require(subs[5].predicates[pstree::selectAccPredIndex(subs[5])].attr == "attr3", "S6 access predicate should be on attr3 (the '=' predicate)");
+    require(subs[0].predicates[pstd.selectAccPredIndex(subs[0])].attr == "attr2", "S1 access predicate should be on attr2");
+    require(subs[1].predicates[pstd.selectAccPredIndex(subs[1])].attr == "attr2", "S2 access predicate should be on attr2");
+    require(subs[2].predicates[pstd.selectAccPredIndex(subs[2])].attr == "attr2", "S3 access predicate should be on attr2");
+    require(subs[3].predicates[pstd.selectAccPredIndex(subs[3])].attr == "attr2", "S4 access predicate should be on attr2");
+    require(subs[4].predicates[pstd.selectAccPredIndex(subs[4])].attr == "attr1", "S5 access predicate should be on attr1 (the '=' predicate)");
+    require(subs[5].predicates[pstd.selectAccPredIndex(subs[5])].attr == "attr3", "S6 access predicate should be on attr3 (the '=' predicate)");
+}
+
+// Regression test for a real bug found via `perf`-profiling a downstream benchmark
+// (nats_sidecar's K=4000-32000 exchange/symbol set-membership benchmark - see
+// pst_dynamic.hpp's own file-level comment for the full story): the paper's raw
+// "narrower value list wins" tie-break conflates "few literals" with "selective," which is
+// only true when every candidate dimension's REAL domain is similarly sized. A subscription
+// referencing a low-cardinality dimension with few literals and a high-cardinality dimension
+// with more literals always picked the low-cardinality one under the old rule - which indexes
+// almost nothing once subscription counts scale up, since nearly every subscription becomes a
+// per-event candidate regardless of which value the event carries.
+//
+// "narrow" and "wide" mirror the real bug's shape (19-value exchange vs. ~12,000-value
+// symbol) at a scale a unit test can afford: 20 warm-up subscriptions teach the tracker that
+// "wide" has a much larger real domain (40 distinct values) than "narrow" (2 distinct values,
+// same 2 values every time) - then a subscription with a 2-literal "narrow" predicate and a
+// 4-literal "wide" predicate should still prefer "wide", because 4/40 is a far smaller
+// fraction of its own domain than 2/2 is of narrow's, even though 4 > 2 in raw literal count.
+// Checked directly against selectAccPredIndex() (side-effect-free, doesn't require actually
+// inserting `sub`) rather than reaching into any other internal state.
+void test_select_acc_pred_prefers_higher_cardinality_dimension() {
+    using pstree::CmpOp;
+    std::vector<pstree::AttrSchema> schema = {
+        {"narrow", pstree::ValueType::kString, 8},
+        {"wide", pstree::ValueType::kString, 8},
+    };
+    pstree::PSTDynamic pstd(schema);
+
+    for (int i = 0; i < 20; ++i) {
+        pstree::Subscription warmup{
+            100 + static_cast<std::uint64_t>(i),
+            {P("narrow", CmpOp::kElemOf, {std::string("a"), std::string("b")}),
+             P("wide", CmpOp::kElemOf,
+               {std::string("w" + std::to_string(i * 2)), std::string("w" + std::to_string(i * 2 + 1))})}};
+        pstd.insertSubscription(warmup);
+    }
+
+    pstree::Subscription sub{1, {
+        P("narrow", CmpOp::kElemOf, {std::string("a"), std::string("b")}),
+        P("wide", CmpOp::kElemOf,
+          {std::string("w0"), std::string("w1"), std::string("w2"), std::string("w3")}),
+    }};
+    std::size_t idx = pstd.selectAccPredIndex(sub);
+    require(sub.predicates[idx].attr == "wide",
+            "wide (40 observed distinct values, 4 literals here) should be preferred over "
+            "narrow (2 observed distinct values, 2 literals) despite having MORE literals - "
+            "the old raw-width rule would have picked narrow and gotten this backwards");
+}
+
+// Insert/delete symmetry under a changing cardinality signal: DeleteSubscription must remove
+// exactly the leaf entries InsertSubscription added, even though `observedValues` (and
+// therefore what selectAccPredIndex() would return if called again) has changed in between by
+// the time delete happens - see pst_dynamic.hpp's own comment on why the chosen index is
+// stored, not recomputed. Deliberately checks by RE-INSERTING the same subscription after
+// deleting it and confirming it still behaves identically (wrong bookkeeping from a
+// mismatched delete would either throw - see deleteSubscription's own logic_error checks - or
+// leave stale leaf entries that would make the id "double count" - both are directly
+// observable via matchEvent's own output, not internal state).
+void test_delete_uses_stored_access_predicate_not_a_recomputed_one() {
+    using pstree::CmpOp;
+    std::vector<pstree::AttrSchema> schema = {
+        {"narrow", pstree::ValueType::kString, 8},
+        {"wide", pstree::ValueType::kString, 8},
+    };
+    pstree::PSTDynamic pstd(schema);
+
+    // sub 1 is inserted FIRST, while both dimensions are still at cardinality 0 - the cold-start
+    // fallback (ratio == raw width) applies, so with EQUAL literal counts (1 each) it's a tie,
+    // falling through to first-in-subscription-order: "narrow" wins as sub 1's access predicate.
+    pstree::Subscription sub1{1, {P("narrow", CmpOp::kElemOf, {std::string("a")}),
+                                   P("wide", CmpOp::kElemOf, {std::string("w0")})}};
+    pstd.insertSubscription(sub1);
+
+    // Now grow "wide"'s observed cardinality far past "narrow"'s, entirely through OTHER
+    // subscriptions - by the time sub 1 is deleted, selectAccPredIndex(sub1) would no longer
+    // agree with what was chosen at its own insert time (it would now prefer "wide", since
+    // narrow is still stuck at cardinality 1 as the only value ever used for it).
+    for (int i = 0; i < 20; ++i) {
+        pstree::Subscription warmup{200 + static_cast<std::uint64_t>(i),
+                                     {P("wide", CmpOp::kElemOf, {std::string("w" + std::to_string(i + 1))})}};
+        pstd.insertSubscription(warmup);
+    }
+    std::size_t recomputedIdx = pstd.selectAccPredIndex(sub1);
+    require(sub1.predicates[recomputedIdx].attr == "wide",
+            "sanity check on the test itself: by now selectAccPredIndex WOULD pick a different "
+            "predicate than sub1's own original insert-time choice - if it didn't, this test "
+            "wouldn't actually be exercising the insert/delete symmetry concern at all");
+
+    // The real check: delete sub1, then confirm an event matching ONLY via "narrow" (the
+    // predicate actually chosen at insert time) no longer matches it, cleanly, with no
+    // exception and no leftover/duplicate entries. If DeleteSubscription had recomputed and
+    // used "wide" instead, it would most likely throw (see deleteSubscription's own
+    // "subscription's group missing on delete" check, since sub1 was never actually inserted
+    // into wide's own tree) - caught here so a reintroduced bug fails this ONE check cleanly
+    // instead of aborting the whole test binary.
+    try {
+        pstd.deleteSubscription(1);
+    } catch (const std::exception& e) {
+        require(false, std::string("deleteSubscription(1) threw - likely recomputed a different "
+                                    "access predicate than insert time chose: ") + e.what());
+        return;
+    }
+    pstree::Event ev = {{"narrow", pstree::Value(std::string("a"))}, {"wide", pstree::Value(std::string("w0"))}};
+    auto matches = pstd.matchEvent(ev);
+    require(std::find(matches.begin(), matches.end(), 1u) == matches.end(),
+            "deleted subscription must not still match");
+
+    // Re-insert the identical subscription and confirm it matches again cleanly - proves
+    // delete's bookkeeping didn't leave the tree in a subtly corrupted state.
+    pstd.insertSubscription(sub1);
+    matches = pstd.matchEvent(ev);
+    require(std::find(matches.begin(), matches.end(), 1u) != matches.end(),
+            "re-inserted subscription must match again");
 }
 
 // Section 5.3: event {attr2:2, attr3:10} should match ONLY S4 - re-derived independently by
@@ -304,6 +423,8 @@ void test_reorganize_groups_preserves_correctness() {
 
 int main() {
     test_select_acc_pred_matches_paper();
+    test_select_acc_pred_prefers_higher_cardinality_dimension();
+    test_delete_uses_stored_access_predicate_not_a_recomputed_one();
     test_section_5_3_event_matching();
     test_individual_subscription_matches();
     test_delete_subscription();

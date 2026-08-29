@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <optional>
 #include <stdexcept>
@@ -147,6 +148,20 @@ public:
         return std::memcmp(data(), other.data(), size_ * sizeof(std::uint16_t)) == 0;
     }
     bool operator!=(const ElementKey& other) const noexcept { return !(*this == other); }
+
+    // No std::hash<ElementKey> specialization - matches this codebase's own existing
+    // convention (see DimSig::Hasher) of a nested Hasher struct passed explicitly as a
+    // container's Hash template parameter, rather than specializing std::hash for a
+    // project-local type.
+    struct Hasher {
+        std::size_t operator()(const ElementKey& key) const noexcept {
+            std::size_t h = key.size_;
+            for (std::size_t i = 0; i < key.size_; ++i) {
+                h ^= std::hash<std::uint16_t>{}(key[i]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            }
+            return h;
+        }
+    };
 
 private:
     // Raw inline storage - never placement-new'd/destroyed element-by-element, since
