@@ -76,6 +76,19 @@ struct SubPredicate {
     // sorted.
     mutable std::vector<Value> vals; // size 1 for most ops, 2 for kBetween, >=1 for kElemOf/kNotElemOf
     mutable bool elemOfSorted = false; // set once `vals` has been sorted for kElemOf/kNotElemOf
+    // Built alongside `vals`' own sort above (same `elemOfSorted` flag guards both), for
+    // kElemOf/kNotElemOf specifically: a type-specialized copy of `vals`' own (already-sorted)
+    // literal values, letting matchValue's binary_search compare PLAIN typed values directly
+    // (bool/int64_t/double/std::string's own native operator<) instead of going through
+    // std::variant's comparison machinery on every one of the O(log n) bisection steps. Only
+    // ONE variant-dispatch (extracting the searched value's own concrete alternative) happens
+    // per matchValue() call, not per comparison inside the search - see matchValue's own
+    // comment for why a hand-rolled index+get dispatch used FOR the comparisons themselves
+    // (tried and measured, twice) was actually slower, and why moving dispatch outside the
+    // loop instead of trying to make it cheaper is what actually pays off.
+    mutable std::variant<std::monostate, std::vector<bool>, std::vector<std::int64_t>,
+                          std::vector<double>, std::vector<std::string>>
+        elemOfTypedCache;
 };
 
 // Small-vector-optimized storage for a subscription's predicates: real subscriptions almost
@@ -292,6 +305,81 @@ inline const Value* findAttr(const Event& event, std::string_view attr) {
     return nullptr;
 }
 
+// Fills pred.elemOfTypedCache from pred.vals (assumed already sorted by Value's own operator<
+// - see matchValue's kElemOf/kNotElemOf case) - extracting same-index elements in order
+// preserves sortedness for the underlying type too, since std::variant's own ordering for two
+// same-alternative values IS that alternative's own ordering. Empty `vals` leaves the cache as
+// std::monostate deliberately (see elemOfTypedContains's own comment for why that's correct,
+// not an oversight).
+inline void buildElemOfTypedCache(const SubPredicate& pred) {
+    if (pred.vals.empty()) return;
+    switch (pred.vals.front().index()) {
+        case 0: {
+            std::vector<bool> v;
+            v.reserve(pred.vals.size());
+            for (const auto& x : pred.vals) v.push_back(std::get<bool>(x));
+            pred.elemOfTypedCache = std::move(v);
+            return;
+        }
+        case 1: {
+            std::vector<std::int64_t> v;
+            v.reserve(pred.vals.size());
+            for (const auto& x : pred.vals) v.push_back(std::get<std::int64_t>(x));
+            pred.elemOfTypedCache = std::move(v);
+            return;
+        }
+        case 2: {
+            std::vector<double> v;
+            v.reserve(pred.vals.size());
+            for (const auto& x : pred.vals) v.push_back(std::get<double>(x));
+            pred.elemOfTypedCache = std::move(v);
+            return;
+        }
+        default: {
+            std::vector<std::string> v;
+            v.reserve(pred.vals.size());
+            for (const auto& x : pred.vals) v.push_back(std::get<std::string>(x));
+            pred.elemOfTypedCache = std::move(v);
+            return;
+        }
+    }
+}
+
+// Binary-searches pred.elemOfTypedCache using val's OWN concrete alternative - exactly one
+// variant-dispatch (std::get<T>(val) below) per call, then a plain std::binary_search over a
+// same-typed std::vector<T> that never touches std::variant again for any of its O(log n)
+// comparisons. If val's type doesn't match what's cached (get_if returns nullptr) this
+// silently returns false rather than throwing - identical to this codebase's own pre-existing
+// behavior for a mismatched `val` on any call AFTER a kElemOf/kNotElemOf predicate's first
+// (type-checked) sort, not a new gap introduced here (see matchValue's own checkSameType,
+// which - both before and after this cache existed - only ever runs on that first call).
+// std::monostate (an empty `vals` list) correctly matches nothing, for either case: the
+// nullptr get_if of any of the four vector alternatives.
+inline bool elemOfTypedContains(const SubPredicate& pred, const Value& val) {
+    switch (val.index()) {
+        case 0:
+            if (auto* v = std::get_if<std::vector<bool>>(&pred.elemOfTypedCache)) {
+                return std::binary_search(v->begin(), v->end(), std::get<bool>(val));
+            }
+            return false;
+        case 1:
+            if (auto* v = std::get_if<std::vector<std::int64_t>>(&pred.elemOfTypedCache)) {
+                return std::binary_search(v->begin(), v->end(), std::get<std::int64_t>(val));
+            }
+            return false;
+        case 2:
+            if (auto* v = std::get_if<std::vector<double>>(&pred.elemOfTypedCache)) {
+                return std::binary_search(v->begin(), v->end(), std::get<double>(val));
+            }
+            return false;
+        default:
+            if (auto* v = std::get_if<std::vector<std::string>>(&pred.elemOfTypedCache)) {
+                return std::binary_search(v->begin(), v->end(), std::get<std::string>(val));
+            }
+            return false;
+    }
+}
+
 // Evaluates one predicate against one concrete value. Throws if `val` and `pred`'s own
 // value(s) aren't the same variant alternative - a schema/caller bug (mixing types for the
 // same attribute), not a matching outcome, so it's surfaced loudly rather than silently
@@ -331,28 +419,29 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
             return val >= pred.vals[0] && val <= pred.vals[1];
-        // Sorts pred.vals (see its own field comment) and binary_searches it instead of a
-        // linear std::variant::operator== scan - real values lists here run up to ~128
-        // elements (e.g. a `symbol in (...)` set-membership subscription), and the linear
-        // scan's per-element std::variant comparison (std::visit's type-erased double
-        // dispatch) was measured via `perf` to dominate matchValue's own self-time at scale.
-        // The one-time sort (and its exhaustive type check, preserving the original
-        // per-element checkSameType behavior exactly once rather than on every match) is
-        // amortized over every subsequent search against this same predicate.
+        // Sorts pred.vals AND builds elemOfTypedCache (see both fields' own comments) instead
+        // of a linear std::variant::operator== scan - real values lists here run up to ~128
+        // elements (e.g. a `symbol in (...)` set-membership subscription). The one-time sort
+        // (and its exhaustive type check, preserving the original per-element checkSameType
+        // behavior exactly once rather than on every match) plus cache build are amortized
+        // over every subsequent search against this same predicate; elemOfTypedContains then
+        // does the actual O(log n) comparisons on plain typed values, not std::variant ones.
         case CmpOp::kElemOf:
             if (!pred.elemOfSorted) {
                 for (const auto& v : pred.vals) checkSameType(v);
                 std::sort(pred.vals.begin(), pred.vals.end());
+                buildElemOfTypedCache(pred);
                 pred.elemOfSorted = true;
             }
-            return std::binary_search(pred.vals.begin(), pred.vals.end(), val);
+            return elemOfTypedContains(pred, val);
         case CmpOp::kNotElemOf:
             if (!pred.elemOfSorted) {
                 for (const auto& v : pred.vals) checkSameType(v);
                 std::sort(pred.vals.begin(), pred.vals.end());
+                buildElemOfTypedCache(pred);
                 pred.elemOfSorted = true;
             }
-            return !std::binary_search(pred.vals.begin(), pred.vals.end(), val);
+            return !elemOfTypedContains(pred, val);
         case CmpOp::kIsNull:
         case CmpOp::kIsNotNull:
             throw std::logic_error("pstree: kIsNull/kIsNotNull must be intercepted by matchSubscription, never reach matchValue");
