@@ -419,6 +419,86 @@ void test_reorganize_groups_preserves_correctness() {
     require(pstd.matchEvent(none).empty(), "an event satisfying the access predicate but no subscription's own extra predicate should match nothing");
 }
 
+// String interning (see pst_dynamic.hpp's StringInternTable): a string well past the OLD
+// StringCodec truncation bound (formerly kPstreeStringMaxLen=32 in nats_sidecar's own usage,
+// and this schema's own stringMaxLen field is now unused/ignored) must still match exactly -
+// interning has no length limit at all, unlike the byte-per-element codec it replaced.
+void test_string_interning_no_length_limit() {
+    std::vector<pstree::AttrSchema> schema = {{"note", pstree::ValueType::kString, 16}};
+    pstree::PSTDynamic pstd(schema);
+
+    std::string longValue(200, 'x'); // far past the old 32-byte cap
+    std::string longValueDiffTail = longValue.substr(0, 199) + "y"; // differs only in the last byte
+    pstree::Subscription sub{1, {pstree::SubPredicate{"note", pstree::CmpOp::kEq, {longValue}}}};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({{"note", pstree::Value(longValue)}}).size() == 1,
+            "a 200-byte string should match itself exactly");
+    require(pstd.matchEvent({{"note", pstree::Value(longValueDiffTail)}}).empty(),
+            "a 200-byte string differing only in its last byte must NOT match - the old "
+            "codec would have silently confused these past its truncation bound, interning "
+            "never does");
+}
+
+// Sentinel-miss guarantee at a scale where an id collision would be easy to introduce by
+// accident (e.g. an off-by-one in id allocation starting the sentinel and the first real id
+// at the same value): insert many distinct strings, then confirm a value NONE of them
+// reference matches nothing, for several never-referenced probes, not just one.
+void test_string_interning_sentinel_miss_at_scale() {
+    std::vector<pstree::AttrSchema> schema = {{"tag", pstree::ValueType::kString, 16}};
+    pstree::PSTDynamic pstd(schema);
+
+    constexpr int kNumSubs = 500;
+    for (int i = 0; i < kNumSubs; ++i) {
+        pstree::Subscription sub;
+        sub.id = static_cast<std::uint64_t>(i + 1);
+        sub.predicates.push_back(
+            pstree::SubPredicate{"tag", pstree::CmpOp::kEq, {std::string("tag-") + std::to_string(i)}});
+        pstd.insertSubscription(sub);
+    }
+
+    for (int i = 0; i < kNumSubs; ++i) {
+        auto m = pstd.matchEvent({{"tag", pstree::Value(std::string("tag-") + std::to_string(i))}});
+        require(m.size() == 1 && contains(m, static_cast<std::uint64_t>(i + 1)),
+                "tag-" + std::to_string(i) + " should match exactly subscription " + std::to_string(i + 1));
+    }
+    for (const std::string& probe : {"never-seen", "tag-", "tag-500", "TAG-0", ""}) {
+        require(pstd.matchEvent({{"tag", pstree::Value(probe)}}).empty(),
+                "never-referenced value '" + probe + "' must match nothing, not collide with a real id");
+    }
+}
+
+// The ordering-op guardrail (see buildLowLevel's own comment): even though nats_sidecar's own
+// shared grammar can never produce an ordering predicate against a string attribute (be-tree's
+// parser.y's num_comp_value is integer/float only - confirmed by reading it directly), this
+// locks in that invariant at pstree's own API boundary, in case a future caller ever
+// constructs a SubPredicate directly, bypassing the dialect layer.
+void test_string_ordering_predicate_rejected() {
+    std::vector<pstree::AttrSchema> schema = {{"label", pstree::ValueType::kString, 16}};
+    pstree::PSTDynamic pstd(schema);
+
+    for (auto op : {pstree::CmpOp::kLt, pstree::CmpOp::kLe, pstree::CmpOp::kGt, pstree::CmpOp::kGe}) {
+        pstree::Subscription sub{1, {pstree::SubPredicate{"label", op, {std::string("m")}}}};
+        bool threw = false;
+        try {
+            pstd.insertSubscription(sub);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        require(threw, "an ordering predicate against a string attribute should be rejected");
+    }
+
+    pstree::Subscription betweenSub{
+        2, {pstree::SubPredicate{"label", pstree::CmpOp::kBetween, {std::string("a"), std::string("z")}}}};
+    bool threw = false;
+    try {
+        pstd.insertSubscription(betweenSub);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "a kBetween predicate against a string attribute should be rejected");
+}
+
 } // namespace
 
 int main() {
@@ -434,6 +514,9 @@ int main() {
     test_is_null_only_predicate_rejected();
     test_is_null_with_indexable_predicate();
     test_reorganize_groups_preserves_correctness();
+    test_string_interning_no_length_limit();
+    test_string_interning_sentinel_miss_at_scale();
+    test_string_ordering_predicate_rejected();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";

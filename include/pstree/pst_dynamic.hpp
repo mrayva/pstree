@@ -73,8 +73,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -88,10 +90,77 @@ namespace pstree {
 
 enum class ValueType { kBoolean, kInteger, kFloat, kString };
 
+// String interning for PS-Tree indexing: this project's shared expression grammar (confirmed by
+// reading be-tree's own parser.y directly - num_comp_value, the value type behind </<=/>/>=, is
+// integer/float only, with no string alternative anywhere in the grammar) can NEVER produce an
+// ordering predicate (kLt/kLe/kGt/kGe/kBetween) against a string-typed attribute - only
+// kEq/kNe/kElemOf/kNotElemOf ever reach a string dimension. PS-Tree's per-dimension element
+// encoding only needs to be ORDER-PRESERVING to support ordering predicates correctly; for
+// equality/set-membership alone, any stable, collision-free (injective) mapping works. That's
+// exactly what this table provides - real strings get interned to small int64_t ids, then flow
+// through the existing Int64Codec (16 elements) instead of StringCodec (up to stringMaxLen
+// elements, 32 in nats_sidecar's own configured usage) - the same mechanism already measured to
+// explain most of pstree's own string-vs-integer matching-cost gap (nats_sidecar's
+// diag_int_attrs.cpp/perf_search_loop experiment), now paid once per with_string()-equivalent
+// event-population call instead of once per PS-Tree comparison, matching how a-tree's own
+// strings.rs::StringTable already works.
+//
+// internForInsert/lookupForSearch are deliberately separate, not one function with a bool flag
+// (this codebase's own convention - see e.g. applyLowLevel's `insert` bool being the one
+// exception, kept only because it mirrors PSTree's own insert/delete pairing): a predicate's own
+// literal value DEFINES the domain (an unseen literal must get a fresh id), while an event's
+// live attribute value must NEVER be allowed to allocate one (a value no subscription ever
+// referenced has to compare unequal to every real interned id, not silently collide with
+// whatever id happens to be allocated next) - returning kSentinel on a lookup miss guarantees
+// that, mirroring a-tree's own StringTable::get() (miss) vs get_or_update() (insert) split.
+class StringInternTable {
+public:
+    // The smallest possible int64_t - matches minKeyFor's own existing "smallest representable
+    // key" convention for kInteger, and can never collide with a real id (ids are allocated
+    // starting at 0, monotonically increasing - see internForInsert).
+    static constexpr std::int64_t kSentinel = std::numeric_limits<std::int64_t>::min();
+
+    std::int64_t internForInsert(std::string_view s) {
+        if (auto it = ids_.find(s); it != ids_.end()) return it->second;
+        std::int64_t id = static_cast<std::int64_t>(ids_.size());
+        auto [it, inserted] = ids_.emplace(std::string(s), id);
+        (void)inserted;
+        return it->second;
+    }
+
+    std::int64_t lookupForSearch(std::string_view s) const {
+        auto it = ids_.find(s);
+        return it != ids_.end() ? it->second : kSentinel;
+    }
+
+private:
+    // Heterogeneous lookup (std::string key, std::string_view probe) - same
+    // transparent-hash/equal_to<> pattern nats_sidecar's own string_view_lookup_map uses, for
+    // the same reason: avoid constructing a temporary std::string just to look up an existing
+    // key. Table lifetime matches one DimensionIndex's own lifetime (see AttrSchema::stringIntern
+    // and PSTDynamic's constructor) - built fresh alongside each from-scratch tree rebuild, never
+    // needing cross-rebuild consistency.
+    struct TransparentStringHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+    std::unordered_map<std::string, std::int64_t, TransparentStringHash, std::equal_to<>> ids_;
+};
+
 struct AttrSchema {
     std::string name;
     ValueType type;
-    std::size_t stringMaxLen = 64; // only meaningful when type == kString
+    std::size_t stringMaxLen = 64; // unused since string interning replaced StringCodec - kept
+                                    // only so any external caller still passing it compiles;
+                                    // remove once nats_sidecar's own kPstreeStringMaxLen is
+                                    // retired.
+    // Lazily allocated by DimensionIndex's constructor for kString attributes - see
+    // StringInternTable's own comment. shared_ptr (not a value member) because AttrSchema gets
+    // copied in places that must all observe the SAME table for a given dimension, not each get
+    // their own.
+    std::shared_ptr<StringInternTable> stringIntern;
 };
 
 namespace detail {
@@ -101,28 +170,50 @@ inline KeyShape shapeFor(const AttrSchema& schema) {
         case ValueType::kBoolean: return BoolCodec::shape();
         case ValueType::kInteger: return Int64Codec::shape();
         case ValueType::kFloat: return DoubleCodec::shape();
-        case ValueType::kString: return StringCodec(schema.stringMaxLen).shape();
+        case ValueType::kString: return Int64Codec::shape(); // interned id, see StringInternTable
     }
     throw std::logic_error("pstree: unreachable ValueType in shapeFor");
 }
 
-inline ElementKey encodeValue(const Value& v, const AttrSchema& schema) {
+// Encodes a PREDICATE's own literal value (insert or delete of a subscription - both need the
+// identical decomposition, see buildLowLevel's own comment) - the domain-defining side, so an
+// unseen string value allocates a fresh id.
+inline ElementKey encodeValueForInsert(const Value& v, const AttrSchema& schema) {
     switch (schema.type) {
         case ValueType::kBoolean: return BoolCodec::encode(std::get<bool>(v));
         case ValueType::kInteger: return Int64Codec::encode(std::get<std::int64_t>(v));
         case ValueType::kFloat: return DoubleCodec::encode(std::get<double>(v));
-        case ValueType::kString: return StringCodec(schema.stringMaxLen).encode(std::get<std::string>(v));
+        case ValueType::kString:
+            return Int64Codec::encode(schema.stringIntern->internForInsert(std::get<std::string>(v)));
     }
-    throw std::logic_error("pstree: unreachable ValueType in encodeValue");
+    throw std::logic_error("pstree: unreachable ValueType in encodeValueForInsert");
 }
 
-// Used for the kNe/kNotElemOf "matches every leaf" fallback (see file-level comment).
+// Encodes an EVENT's own live attribute value (MatchEvent) - read-only, so a string value no
+// subscription ever referenced maps to StringInternTable::kSentinel instead of allocating,
+// guaranteeing it can't spuriously match any real interned id.
+inline ElementKey encodeValueForSearch(const Value& v, const AttrSchema& schema) {
+    switch (schema.type) {
+        case ValueType::kBoolean: return BoolCodec::encode(std::get<bool>(v));
+        case ValueType::kInteger: return Int64Codec::encode(std::get<std::int64_t>(v));
+        case ValueType::kFloat: return DoubleCodec::encode(std::get<double>(v));
+        case ValueType::kString:
+            return Int64Codec::encode(schema.stringIntern->lookupForSearch(std::get<std::string>(v)));
+    }
+    throw std::logic_error("pstree: unreachable ValueType in encodeValueForSearch");
+}
+
+// Used for the kNe/kNotElemOf "matches every leaf" fallback (see file-level comment). A
+// codec-level constant (the smallest representable key in the dimension's own keyspace), not
+// tied to any real value - kString now shares kInteger's own int64_t keyspace (see
+// StringInternTable), so it shares this same fallback with no string-specific logic needed.
 inline ElementKey minKeyFor(const AttrSchema& schema) {
     switch (schema.type) {
         case ValueType::kBoolean: return BoolCodec::encode(false);
-        case ValueType::kInteger: return Int64Codec::encode(std::numeric_limits<std::int64_t>::min());
+        case ValueType::kInteger:
+        case ValueType::kString:
+            return Int64Codec::encode(std::numeric_limits<std::int64_t>::min());
         case ValueType::kFloat: return DoubleCodec::encode(-std::numeric_limits<double>::infinity());
-        case ValueType::kString: return StringCodec(schema.stringMaxLen).encode("");
     }
     throw std::logic_error("pstree: unreachable ValueType in minKeyFor");
 }
@@ -226,6 +317,9 @@ public:
     explicit PSTDynamic(std::vector<AttrSchema> schema) {
         for (auto& s : schema) {
             std::string name = s.name;
+            if (s.type == ValueType::kString && !s.stringIntern) {
+                s.stringIntern = std::make_shared<StringInternTable>();
+            }
             dimensions_.try_emplace(name, std::move(s));
         }
     }
@@ -276,6 +370,37 @@ public:
                 "', which has no representable PS-Tree range (add at least one other, "
                 "indexable predicate to this subscription)");
         }
+        // Ordering predicates against a string-typed dimension have no valid meaning under
+        // string interning (see StringInternTable's own comment: interned ids are NOT
+        // order-preserving w.r.t. the original strings) - checked HERE, before
+        // InsertSubscription does any state mutation (subscriptions_.emplace, PS-Tree
+        // insertion), not inside buildLowLevel, specifically so a rejection here never leaves
+        // a half-registered subscription behind (buildLowLevel already runs after
+        // subscriptions_.emplace - see insertSubscription). This can never actually trigger
+        // through nats_sidecar's own dialect translation (be-tree's parser.y's num_comp_value,
+        // the type behind </<=/>/>=, is integer/float only - confirmed by reading it
+        // directly), but guards the invariant loudly in case a future caller ever constructs a
+        // SubPredicate directly, bypassing the dialect layer.
+        switch (sub.predicates[best].op) {
+            case CmpOp::kLt:
+            case CmpOp::kLe:
+            case CmpOp::kGt:
+            case CmpOp::kGe:
+            case CmpOp::kBetween: {
+                auto dimIt = dimensions_.find(sub.predicates[best].attr);
+                if (dimIt != dimensions_.end() && dimIt->second.schema.type == ValueType::kString) {
+                    throw std::invalid_argument(
+                        "pstree: subscription " + std::to_string(sub.id) +
+                        " cannot be indexed - its best available access predicate is an "
+                        "ordering comparison (</<=/>/>=/between) on string-typed attribute '" +
+                        sub.predicates[best].attr +
+                        "', which interned string ids do not support");
+                }
+                break;
+            }
+            default:
+                break;
+        }
         return best;
     }
 
@@ -297,7 +422,8 @@ public:
             auto predDimIt = dimensions_.find(pred.attr);
             if (predDimIt == dimensions_.end()) continue; // unknown dimension - rejected below if selected
             for (const auto& v : pred.vals) {
-                predDimIt->second.observedValues.insert(detail::encodeValue(v, predDimIt->second.schema));
+                predDimIt->second.observedValues.insert(
+                    detail::encodeValueForInsert(v, predDimIt->second.schema));
             }
         }
 
@@ -355,7 +481,7 @@ public:
             if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
             const DimensionIndex& dim = dimIt->second;
 
-            ElementKey key = detail::encodeValue(pair.val, dim.schema);
+            ElementKey key = detail::encodeValueForSearch(pair.val, dim.schema);
             // A point can now be covered by several buckets at once (an equality bucket plus
             // any number of ancestor range markers along its path - see ps_tree.hpp's
             // canonical-decomposition redesign), not just one leaf.
@@ -501,31 +627,35 @@ private:
     // deterministic from `pred`/`dim.schema` alone - exactly what guarantees insert and delete
     // (and, for delete, the later reclaim() pass - see deleteSubscription) all agree on the
     // identical decomposition.
+    // Precondition: an ordering op (kLt/kLe/kGt/kGe/kBetween) against a string-typed dimension
+    // is already rejected earlier, at selectAccPredIndex time - see that function's own comment
+    // for why the check has to happen there and not here (this runs after
+    // insertSubscription has already registered the subscription in subscriptions_).
     static std::vector<Predicate> buildLowLevel(DimensionIndex& dim, const SubPredicate& pred) {
         std::vector<Predicate> lowLevel;
         switch (pred.op) {
             case CmpOp::kLt: {
-                auto prev = prevElementKey(dim.tree.shape(), detail::encodeValue(pred.vals.at(0), dim.schema));
+                auto prev = prevElementKey(dim.tree.shape(), detail::encodeValueForInsert(pred.vals.at(0), dim.schema));
                 if (prev) lowLevel.push_back({Op::kLe, *prev, {}});
                 break;
             }
             case CmpOp::kLe:
-                lowLevel.push_back({Op::kLe, detail::encodeValue(pred.vals.at(0), dim.schema), {}});
+                lowLevel.push_back({Op::kLe, detail::encodeValueForInsert(pred.vals.at(0), dim.schema), {}});
                 break;
             case CmpOp::kEq:
-                lowLevel.push_back({Op::kEq, detail::encodeValue(pred.vals.at(0), dim.schema), {}});
+                lowLevel.push_back({Op::kEq, detail::encodeValueForInsert(pred.vals.at(0), dim.schema), {}});
                 break;
             case CmpOp::kGt: {
-                auto next = nextElementKey(dim.tree.shape(), detail::encodeValue(pred.vals.at(0), dim.schema));
+                auto next = nextElementKey(dim.tree.shape(), detail::encodeValueForInsert(pred.vals.at(0), dim.schema));
                 if (next) lowLevel.push_back({Op::kGe, *next, {}});
                 break;
             }
             case CmpOp::kGe:
-                lowLevel.push_back({Op::kGe, detail::encodeValue(pred.vals.at(0), dim.schema), {}});
+                lowLevel.push_back({Op::kGe, detail::encodeValueForInsert(pred.vals.at(0), dim.schema), {}});
                 break;
             case CmpOp::kBetween:
-                lowLevel.push_back({Op::kIn, detail::encodeValue(pred.vals.at(0), dim.schema),
-                                     detail::encodeValue(pred.vals.at(1), dim.schema)});
+                lowLevel.push_back({Op::kIn, detail::encodeValueForInsert(pred.vals.at(0), dim.schema),
+                                     detail::encodeValueForInsert(pred.vals.at(1), dim.schema)});
                 break;
             case CmpOp::kElemOf: {
                 // Deduplicate by encoded key: kElemOf's set semantics mean a repeated
@@ -537,7 +667,7 @@ private:
                 // Caught by test_pst_dynamic_stress.cpp generating exactly this case.
                 std::vector<ElementKey> seen;
                 for (auto& v : pred.vals) {
-                    ElementKey key = detail::encodeValue(v, dim.schema);
+                    ElementKey key = detail::encodeValueForInsert(v, dim.schema);
                     if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
                     seen.push_back(key);
                     lowLevel.push_back({Op::kEq, key, {}});
