@@ -499,6 +499,63 @@ void test_string_ordering_predicate_rejected() {
     require(threw, "a kBetween predicate against a string attribute should be rejected");
 }
 
+// Regression for a real bug caught by test_pst_dynamic_stress.cpp's own randomized fuzzing: the
+// ordering-op-vs-string guardrail originally only checked whichever predicate selectAccPredIndex
+// chose as the access predicate - too narrow, since string interning applies to ALL of a
+// subscription's string-typed predicate values, not just the access predicate's. A NON-access
+// ordering predicate on a string dimension would silently compare wrong (non-order-preserving)
+// interned integers instead of being rejected. This subscription's "code" predicate (kEq, high
+// selectivity) is always chosen as the access predicate over "label" (kLt, lower selectivity per
+// opRank) - so without the fix, "label"'s kLt would slip through uncaught.
+void test_string_ordering_predicate_rejected_when_not_the_access_predicate() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"code", pstree::ValueType::kInteger, 0}, {"label", pstree::ValueType::kString, 16}};
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{1, {pstree::SubPredicate{"code", pstree::CmpOp::kEq, {std::int64_t{7}}},
+                                  pstree::SubPredicate{"label", pstree::CmpOp::kLt, {std::string("m")}}}};
+    bool threw = false;
+    try {
+        pstd.insertSubscription(sub);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "an ordering predicate on a NON-access string attribute should also be rejected");
+}
+
+// The actual point of interning the full-verification path (not just the access predicate's own
+// PS-Tree indexing - see pst_dynamic.hpp's insertSubscription/matchEvent comments): a
+// subscription with TWO string kElemOf predicates, where only one can be the access predicate,
+// must still match/reject correctly via the OTHER one's full-verification check.
+void test_two_string_elem_of_predicates_non_access_one_still_correct() {
+    std::vector<pstree::AttrSchema> schema = {{"exchange", pstree::ValueType::kString, 16},
+                                               {"symbol", pstree::ValueType::kString, 16}};
+    pstree::PSTDynamic pstd(schema);
+    // Both kElemOf, same tier - "exchange" (narrower list) loses the cardinality tie-break once
+    // "symbol" has been observed with more distinct values, but either way, EXACTLY one becomes
+    // the access predicate and the other is checked via full verification only.
+    pstree::Subscription sub{
+        1, {pstree::SubPredicate{"exchange", pstree::CmpOp::kElemOf,
+                                  {std::string("A"), std::string("B")}},
+            pstree::SubPredicate{"symbol", pstree::CmpOp::kElemOf,
+                                  {std::string("AAPL"), std::string("MSFT")}}}};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({{"exchange", pstree::Value(std::string("A"))},
+                             {"symbol", pstree::Value(std::string("AAPL"))}})
+                .size() == 1,
+            "exchange=A/symbol=AAPL should match (both predicates satisfied)");
+    require(pstd.matchEvent({{"exchange", pstree::Value(std::string("A"))},
+                             {"symbol", pstree::Value(std::string("GOOG"))}})
+                .empty(),
+            "exchange=A/symbol=GOOG should NOT match - symbol fails whichever predicate it is "
+            "(access or full-verification)");
+    require(pstd.matchEvent({{"exchange", pstree::Value(std::string("Z"))},
+                             {"symbol", pstree::Value(std::string("AAPL"))}})
+                .empty(),
+            "exchange=Z/symbol=AAPL should NOT match - exchange fails whichever predicate it is "
+            "(access or full-verification)");
+}
+
 } // namespace
 
 int main() {
@@ -517,6 +574,8 @@ int main() {
     test_string_interning_no_length_limit();
     test_string_interning_sentinel_miss_at_scale();
     test_string_ordering_predicate_rejected();
+    test_string_ordering_predicate_rejected_when_not_the_access_predicate();
+    test_two_string_elem_of_predicates_non_access_one_still_correct();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";
