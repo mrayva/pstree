@@ -491,6 +491,67 @@ inline bool scalarCompare(const Value& val, const CacheVariant& cache, Cmp cmp) 
     }
 }
 
+// Builds this predicate's ENTIRE comparison cache from its own literal values alone (no event
+// value needed/used) - primaryCache/betweenUpperCache for scalar ops, the sorted-and-typed
+// primaryCache for kElemOf/kNotElemOf. Callers: PSTDynamic::insertSubscription, exactly once per
+// predicate, single-threaded, before the subscription becomes reachable by any concurrent
+// matchEvent() call (see pst_dynamic.hpp's own comment on that call site for the real bug this
+// fixes - a SIGSEGV in std::variant::_M_reset, root-caused to two worker threads racing to
+// lazily build/reset this SAME cache the first time each independently reached matchValue for
+// the same subscription. matching_engine::search() is explicitly documented as safe to call
+// concurrently across worker threads - that promise was being broken by this lazy-build-on-
+// first-match pattern, not upheld by it). matchValue() below now REQUIRES the cache already be
+// built (throws otherwise) rather than lazily building it - a hot-path read is trivially safe to
+// share across threads; a hot-path WRITE is exactly what was racing.
+//
+// The internal-consistency check below (every kElemOf/kNotElemOf literal shares one type)
+// replaces the old lazy path's per-call checkSameType-against-the-incoming-event-value loop,
+// which could only run against whichever event happened to trigger the first-ever match - this
+// version checks the predicate's own literals against EACH OTHER, which is both the real
+// invariant being protected and now checkable with no event in hand at all.
+inline void ensurePredicateCachedForInsert(const SubPredicate& pred) {
+    if (pred.primaryCached) return;
+    switch (pred.op) {
+        case CmpOp::kLt:
+        case CmpOp::kLe:
+        case CmpOp::kEq:
+        case CmpOp::kNe:
+        case CmpOp::kGt:
+        case CmpOp::kGe:
+        case CmpOp::kBetween:
+            ensureScalarCached(pred);
+            return;
+        case CmpOp::kElemOf:
+        case CmpOp::kNotElemOf: {
+            if (!pred.vals.empty()) {
+                std::size_t expectedIndex = pred.vals.front().index();
+                for (const auto& v : pred.vals) {
+                    if (v.index() != expectedIndex) {
+                        throw std::invalid_argument(
+                            "pstree: predicate on attribute '" + pred.attr +
+                            "' has inconsistently-typed literal values");
+                    }
+                }
+            }
+            std::sort(pred.vals.begin(), pred.vals.end());
+            buildElemOfTypedCache(pred);
+            pred.primaryCached = true;
+            return;
+        }
+        case CmpOp::kIsNull:
+        case CmpOp::kIsNotNull:
+            return; // no value-based cache - matchSubscription intercepts both before matchValue
+    }
+}
+
+[[noreturn, gnu::cold, gnu::noinline]]
+inline void throwPredicateCacheNotBuilt(const std::string& attr) {
+    throw std::logic_error(
+        "pstree: predicate cache for attribute '" + attr + "' was not built at insert time - "
+        "ensurePredicateCachedForInsert must be called from PSTDynamic::insertSubscription "
+        "before this subscription is reachable by matchEvent");
+}
+
 // Out-of-line and marked cold/noinline so the exception-construction code (a string
 // concatenation, an allocation, the throw itself) never counts against the inliner's size
 // estimate for whatever calls it. Found via `perf annotate` on the real trade_volume/trade_price
@@ -523,59 +584,49 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
             throwMatchValueTypeMismatch(pred.attr);
         }
     };
+    // The cache is REQUIRED to already be built - see ensurePredicateCachedForInsert's own
+    // comment for why this is a hard requirement (a thread-safety fix), not a convenience
+    // check: lazily building it here, from whichever worker thread happens to reach it first,
+    // is exactly the unsynchronized write that used to corrupt this predicate's cache under
+    // concurrent matchEvent() calls.
+    if (pred.op != CmpOp::kIsNull && pred.op != CmpOp::kIsNotNull && !pred.primaryCached) {
+        throwPredicateCacheNotBuilt(pred.attr);
+    }
     switch (pred.op) {
         case CmpOp::kLt:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::less<>{});
         case CmpOp::kLe:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::less_equal<>{});
         case CmpOp::kEq:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::equal_to<>{});
         case CmpOp::kNe:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return !scalarCompare(val, pred.primaryCache, std::equal_to<>{});
         case CmpOp::kGt:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::greater<>{});
         case CmpOp::kGe:
             checkSameType(pred.vals.at(0));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::greater_equal<>{});
         case CmpOp::kBetween:
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
-            ensureScalarCached(pred);
             return scalarCompare(val, pred.primaryCache, std::greater_equal<>{}) &&
                    scalarCompare(val, *pred.betweenUpperCache, std::less_equal<>{});
         // Sorts pred.vals AND builds primaryCache (see both fields' own comments) instead
         // of a linear std::variant::operator== scan - real values lists here run up to ~128
-        // elements (e.g. a `symbol in (...)` set-membership subscription). The one-time sort
-        // (and its exhaustive type check, preserving the original per-element checkSameType
-        // behavior exactly once rather than on every match) plus cache build are amortized
-        // over every subsequent search against this same predicate; elemOfTypedContains then
-        // does the actual O(log n) comparisons on plain typed values, not std::variant ones.
+        // elements (e.g. a `symbol in (...)` set-membership subscription). elemOfTypedContains
+        // does the actual O(log n) comparisons on plain typed values, not std::variant ones -
+        // both the sort and the cache build already happened at insert time (see
+        // ensurePredicateCachedForInsert), so this is a pure read.
         case CmpOp::kElemOf:
-            if (!pred.primaryCached) {
-                for (const auto& v : pred.vals) checkSameType(v);
-                std::sort(pred.vals.begin(), pred.vals.end());
-                buildElemOfTypedCache(pred);
-                pred.primaryCached = true;
-            }
+            checkSameType(pred.vals.at(0));
             return elemOfTypedContains(pred, val);
         case CmpOp::kNotElemOf:
-            if (!pred.primaryCached) {
-                for (const auto& v : pred.vals) checkSameType(v);
-                std::sort(pred.vals.begin(), pred.vals.end());
-                buildElemOfTypedCache(pred);
-                pred.primaryCached = true;
-            }
+            checkSameType(pred.vals.at(0));
             return !elemOfTypedContains(pred, val);
         case CmpOp::kIsNull:
         case CmpOp::kIsNotNull:

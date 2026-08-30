@@ -165,6 +165,11 @@ void test_random_insert_delete_matches_brute_force() {
             } catch (const std::invalid_argument&) {
                 continue;
             }
+            // The oracle's own copy is independent of PSTDynamic's internal (interned) one -
+            // matchValue() now REQUIRES a predicate's cache be built before use (see
+            // predicate.hpp's ensurePredicateCachedForInsert), so this copy needs the same
+            // one-time build PSTDynamic already does internally for its own copy.
+            for (auto& pred : sub.predicates) pstree::ensurePredicateCachedForInsert(pred);
             active.push_back(sub);
         } else {
             std::uniform_int_distribution<std::size_t> pick(0, active.size() - 1);

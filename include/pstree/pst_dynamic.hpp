@@ -456,6 +456,17 @@ public:
             for (const auto& v : pred.vals) {
                 predDim.observedValues.insert(detail::encodeValue(v, predDim.schema));
             }
+
+            // Builds this predicate's comparison cache NOW, single-threaded, before this
+            // subscription is ever reachable by a concurrent matchEvent() call (the
+            // subscriptions_.emplace below is what first makes it reachable) - see
+            // ensurePredicateCachedForInsert's own comment in predicate.hpp for the real
+            // thread-safety bug this fixes (a SIGSEGV reproduced with worker_threads>1: two
+            // threads racing to lazily build/reset the SAME predicate's cache on their first
+            // independent call into matchValue). Applied to EVERY predicate, not just this
+            // subscription's eventual access predicate - matchValue's own full-verification
+            // path evaluates every OTHER predicate too.
+            ensurePredicateCachedForInsert(pred);
         }
 
         std::size_t accIdx = selectAccPredIndex(interned);

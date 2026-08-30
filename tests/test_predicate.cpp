@@ -21,7 +21,14 @@ void require(bool cond, const std::string& message) {
 }
 
 pstree::SubPredicate pred(std::string attr, pstree::CmpOp op, std::vector<pstree::Value> vals) {
-    return pstree::SubPredicate{std::move(attr), op, std::move(vals)};
+    pstree::SubPredicate p{std::move(attr), op, std::move(vals)};
+    // matchValue() now REQUIRES a predicate's comparison cache be built before use (a
+    // thread-safety fix - see predicate.hpp's ensurePredicateCachedForInsert) instead of lazily
+    // building it on first call. This test file calls matchValue() directly (unit-testing it in
+    // isolation, not through PSTDynamic::insertSubscription, which is where a real caller's
+    // cache gets built), so every predicate built here needs the same one-time call.
+    pstree::ensurePredicateCachedForInsert(p);
+    return p;
 }
 
 void test_relational_operators_int() {
@@ -58,15 +65,15 @@ void test_elem_of_and_not_elem_of() {
     require(pstree::matchValue(pstree::Value(std::string("z")), pNot), "'z' satisfies not-elem-of {a,b,c}");
 }
 
-// Regression test: matchValue() lazily sorts a kElemOf/kNotElemOf predicate's vals in place
-// (once) so it can binary_search instead of a linear scan (see SubPredicate's own field
-// comment and matchValue()'s kElemOf/kNotElemOf case comment in predicate.hpp) - the OTHER
-// test above happens to use an already-alphabetically-sorted input list ({a,b,c}), which
+// Regression test: ensurePredicateCachedForInsert() sorts a kElemOf/kNotElemOf predicate's
+// vals in place (once, at insert time - see predicate.hpp's own comment on why this moved out
+// of matchValue() itself) so matchValue() can binary_search instead of a linear scan. The
+// OTHER test above happens to use an already-alphabetically-sorted input list ({a,b,c}), which
 // would pass even with a broken sort/binary_search pairing. This one uses a deliberately
 // scrambled, larger list (including a repeated value and mixed-magnitude integers, not just
 // alphabetically-orderable strings) and calls matchValue() many times against the SAME
-// SubPredicate object (mirroring the real reuse-across-many-events pattern) to also exercise
-// the "already sorted from a prior call" branch, not just the first-call sort path.
+// SubPredicate object (mirroring the real reuse-across-many-events pattern) to confirm the
+// sort-then-binary_search pairing itself is correct, not just a single lookup.
 void test_elem_of_with_unsorted_input_and_repeated_calls() {
     using pstree::CmpOp;
     auto p = pred("port", CmpOp::kElemOf,
@@ -84,22 +91,22 @@ void test_elem_of_with_unsorted_input_and_repeated_calls() {
     require(pstree::matchValue(pstree::Value(std::int64_t{9999}), pNot), "9999 satisfies not-elem-of scrambled list (repeat call)");
 }
 
-// Guards the scalarCache0/scalarCache1 lazy-cache mechanism added 2026-08-29 (see matchValue's
-// own kLt/kLe/kEq/kNe/kGt/kGe cases) - reuses ONE kGe predicate (the exact shape a
-// trade_volume-style "attr >= threshold" range predicate compiles down to) across several
-// calls with DIFFERENT values, some on either side of the threshold and one exactly on it,
-// so a stale or incorrectly-cached comparison would show up as a wrong result on a later
-// call, not just the first (uncached) one.
+// Guards the primaryCache scalar-cache mechanism (see matchValue's own kLt/kLe/kEq/kNe/kGt/kGe
+// cases, built eagerly by ensurePredicateCachedForInsert - see predicate.hpp) - reuses ONE kGe
+// predicate (the exact shape a trade_volume-style "attr >= threshold" range predicate compiles
+// down to) across several calls with DIFFERENT values, some on either side of the threshold and
+// one exactly on it, so a stale or incorrectly-cached comparison would show up as a wrong
+// result on a later call, not just the first one.
 void test_scalar_cache_with_repeated_calls() {
     using pstree::CmpOp;
     auto p = pred("volume", CmpOp::kGe, {std::int64_t{100}});
-    require(!pstree::matchValue(pstree::Value(std::int64_t{50}), p), "50 !>= 100 (first call, builds cache)");
+    require(!pstree::matchValue(pstree::Value(std::int64_t{50}), p), "50 !>= 100");
     require(pstree::matchValue(pstree::Value(std::int64_t{100}), p), "100 >= 100 (cached, on threshold)");
     require(pstree::matchValue(pstree::Value(std::int64_t{1000}), p), "1000 >= 100 (cached, well above)");
     require(!pstree::matchValue(pstree::Value(std::int64_t{99}), p), "99 !>= 100 (cached, just below)");
 
     auto p2 = pred("price", CmpOp::kLe, {2.5});
-    require(pstree::matchValue(pstree::Value(1.0), p2), "1.0 <= 2.5 (first call, builds cache)");
+    require(pstree::matchValue(pstree::Value(1.0), p2), "1.0 <= 2.5");
     require(pstree::matchValue(pstree::Value(2.5), p2), "2.5 <= 2.5 (cached, on threshold)");
     require(!pstree::matchValue(pstree::Value(3.0), p2), "3.0 !<= 2.5 (cached, above)");
 }

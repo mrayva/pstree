@@ -51,6 +51,16 @@ foreach(test_name IN LISTS PSTREE_UNIT_TESTS)
     add_pstree_test(${test_name})
 endforeach()
 
+# Separate from PSTREE_UNIT_TESTS (not because it's less important, but because it's a real
+# multi-threaded stress test, not a fast deterministic unit test - a few seconds by design, and
+# most useful built with -fsanitize=thread, which this project's own ASan build can't combine
+# with (see the .cpp's own top comment for exactly how to do that manually). Still registered as
+# a plain ctest target too, so a no-TSan CI run at least catches an outright crash/exception, not
+# just the data race itself.
+find_package(Threads REQUIRED)
+add_pstree_test(test_pst_dynamic_concurrent)
+target_link_libraries(test_pst_dynamic_concurrent PRIVATE Threads::Threads)
+
 message(STATUS "")
 message(STATUS "pstree configuration:")
 message(STATUS "  BUILD_EXAMPLES: ${BUILD_EXAMPLES}")
