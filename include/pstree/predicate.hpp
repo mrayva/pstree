@@ -206,9 +206,11 @@ public:
     PredicateList(PredicateList&& other) noexcept {
         if (other.heap_ != nullptr) {
             heap_ = other.heap_;
+            data_ = heap_;
             heapCapacity_ = other.heapCapacity_;
             size_ = other.size_;
             other.heap_ = nullptr;
+            other.data_ = other.inlineData();
             other.heapCapacity_ = 0;
             other.size_ = 0;
         } else {
@@ -230,13 +232,16 @@ public:
         if (heap_ != nullptr) {
             ::operator delete(heap_);
             heap_ = nullptr;
+            data_ = inlineData(); // must be valid again before any pushBackUnchecked below
             heapCapacity_ = 0;
         }
         if (other.heap_ != nullptr) {
             heap_ = other.heap_;
+            data_ = heap_;
             heapCapacity_ = other.heapCapacity_;
             size_ = other.size_;
             other.heap_ = nullptr;
+            other.data_ = other.inlineData();
             other.heapCapacity_ = 0;
             other.size_ = 0;
         } else {
@@ -284,14 +289,27 @@ private:
     // manually destroyed exactly like std::vector's own heap buffer, just embedded directly
     // in the object instead of allocated, for the common (small) case.
     alignas(SubPredicate) unsigned char inline_[kInlineCapacity * sizeof(SubPredicate)];
-    SubPredicate* heap_ = nullptr; // non-null once spilled to the heap; inline_ unused thereafter
+    SubPredicate* heap_ = nullptr; // non-null once spilled to the heap; inline_ unused thereafter -
+                                    // its ONLY remaining job is "do I own a heap buffer to free,"
+                                    // NOT "where do the elements live" (see data_ below).
+    // Found 2026-08-30, alongside shrinking SubPredicate itself: data() used to be a branch
+    // (`heap_ != nullptr ? heap_ : inlineData()`) re-evaluated on every single access - cheap in
+    // isolation, but `perf annotate` on the real trade_volume/trade_price benchmark showed this
+    // exact branch+load sitting right where a Subscription's own storage was already a cache-miss
+    // hot spot (see SubPredicate's own comment). Caching the answer in data_ - updated exactly
+    // once, at the one moment storage actually changes (construction, growTo, a move that steals
+    // another buffer) - turns every read into a single direct pointer load, matching the idiom
+    // LLVM's SmallVector/folly's small_vector use for the same reason: every function below that
+    // used to call data() must keep data_ correct instead, which is why every heap_ assignment
+    // in this class has a matching data_ assignment right next to it.
+    SubPredicate* data_ = inlineData(); // ALWAYS valid: wherever the active elements actually live
     std::size_t heapCapacity_ = 0; // element capacity of *heap_; meaningless while heap_ == nullptr
     std::size_t size_ = 0;         // constructed-element count, in whichever storage is live
 
     SubPredicate* inlineData() noexcept { return reinterpret_cast<SubPredicate*>(inline_); }
     const SubPredicate* inlineData() const noexcept { return reinterpret_cast<const SubPredicate*>(inline_); }
-    SubPredicate* data() noexcept { return heap_ != nullptr ? heap_ : inlineData(); }
-    const SubPredicate* data() const noexcept { return heap_ != nullptr ? heap_ : inlineData(); }
+    SubPredicate* data() noexcept { return data_; }
+    const SubPredicate* data() const noexcept { return data_; }
 
     void reserveAtLeast(std::size_t n) {
         if (n > kInlineCapacity) growTo(n);
@@ -321,6 +339,7 @@ private:
         for (std::size_t j = 0; j < size_; ++j) oldData[j].~SubPredicate();
         if (heap_ != nullptr) ::operator delete(heap_);
         heap_ = newBuf;
+        data_ = newBuf;
         heapCapacity_ = newCapacity;
     }
 
