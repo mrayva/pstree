@@ -432,6 +432,22 @@ inline bool scalarCompare(const Value& val, const ScalarCache& cache, Cmp cmp) {
     }
 }
 
+// Out-of-line and marked cold/noinline so the exception-construction code (a string
+// concatenation, an allocation, the throw itself) never counts against the inliner's size
+// estimate for whatever calls it. Found via `perf annotate` on the real trade_volume/trade_price
+// benchmark (2026-08-30): matchValue's own checkSameType lambda - despite being one comparison
+// on the hot path - was NOT being inlined at any of its call sites, because the compiler weighs
+// a candidate's cold/never-taken paths against its size just like its hot ones. Disassembling
+// the resulting out-of-line lambda showed ~57% of its cost was plain call/ret prologue-epilogue
+// (4 callee-saved register spills) and ~40% was stack-protector canary setup/check - the actual
+// comparison was ~2%. Extracting the throw into its own cold function shrinks checkSameType back
+// down to the trivial size the inliner will actually fold into every one of matchValue's call
+// sites, eliminating that call/canary overhead from the hot path entirely.
+[[noreturn, gnu::cold, gnu::noinline]]
+inline void throwMatchValueTypeMismatch(const std::string& attr) {
+    throw std::invalid_argument("pstree: matchValue type mismatch for attribute '" + attr + "'");
+}
+
 // Evaluates one predicate against one concrete value. Throws if `val` and `pred`'s own
 // value(s) aren't the same variant alternative - a schema/caller bug (mixing types for the
 // same attribute), not a matching outcome, so it's surfaced loudly rather than silently
@@ -445,7 +461,7 @@ inline bool scalarCompare(const Value& val, const ScalarCache& cache, Cmp cmp) {
 inline bool matchValue(const Value& val, const SubPredicate& pred) {
     auto checkSameType = [&](const Value& other) {
         if (val.index() != other.index()) {
-            throw std::invalid_argument("pstree: matchValue type mismatch for attribute '" + pred.attr + "'");
+            throwMatchValueTypeMismatch(pred.attr);
         }
     };
     switch (pred.op) {
