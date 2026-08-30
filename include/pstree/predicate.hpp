@@ -148,7 +148,7 @@ struct SubPredicate {
         : attr(std::move(attr_)), op(op_), vals(std::move(vals_)) {}
 
     SubPredicate(const SubPredicate& other)
-        : attr(other.attr), op(other.op), vals(other.vals), attrIndex(other.attrIndex),
+        : attr(other.attr), op(other.op), attrIndex(other.attrIndex), vals(other.vals),
           primaryCached(other.primaryCached), primaryCache(other.primaryCache),
           betweenUpperCache(other.betweenUpperCache
                                  ? std::make_unique<ScalarCache>(*other.betweenUpperCache)
