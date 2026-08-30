@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -63,6 +64,17 @@ enum class CmpOp {
 // doc comment for what happens if a caller violates it).
 using Value = std::variant<bool, std::int64_t, double, std::string>;
 
+// Lazily-cached, concretely-typed form of a single Value - used for kBetween's second operand
+// (see SubPredicate::betweenUpperCache below).
+using ScalarCache = std::variant<std::monostate, bool, std::int64_t, double, std::string>;
+
+// Lazily-cached, concretely-typed form of EITHER an elemOf-family predicate's whole (sorted)
+// value list OR a scalar-family predicate's single vals[0] threshold - see SubPredicate's own
+// comment for why these two share one variant instead of each getting their own.
+using PrimaryCache = std::variant<std::monostate, std::vector<bool>, std::vector<std::int64_t>,
+                                   std::vector<double>, std::vector<std::string>,
+                                   bool, std::int64_t, double, std::string>;
+
 struct SubPredicate {
     std::string attr;
     CmpOp op;
@@ -76,28 +88,67 @@ struct SubPredicate {
     // vals.at(1) for kBetween's [lo,hi]) are untouched since only kElemOf/kNotElemOf ever get
     // sorted.
     mutable std::vector<Value> vals; // size 1 for most ops, 2 for kBetween, >=1 for kElemOf/kNotElemOf
-    mutable bool elemOfSorted = false; // set once `vals` has been sorted for kElemOf/kNotElemOf
-    // Built alongside `vals`' own sort above (same `elemOfSorted` flag guards both), for
-    // kElemOf/kNotElemOf specifically: a type-specialized copy of `vals`' own (already-sorted)
-    // literal values, letting matchValue's binary_search compare PLAIN typed values directly
-    // (bool/int64_t/double/std::string's own native operator<) instead of going through
-    // std::variant's comparison machinery on every one of the O(log n) bisection steps. Only
-    // ONE variant-dispatch (extracting the searched value's own concrete alternative) happens
-    // per matchValue() call, not per comparison inside the search - see matchValue's own
-    // comment for why a hand-rolled index+get dispatch used FOR the comparisons themselves
-    // (tried and measured, twice) was actually slower, and why moving dispatch outside the
-    // loop instead of trying to make it cheaper is what actually pays off.
-    mutable std::variant<std::monostate, std::vector<bool>, std::vector<std::int64_t>,
-                          std::vector<double>, std::vector<std::string>>
-        elemOfTypedCache;
 
-    // Same principle as elemOfTypedCache, for the scalar comparison ops (kLt/kLe/kEq/kNe/
-    // kGt/kGe/kBetween): a lazily-extracted, concretely-typed copy of vals[0] (and vals[1]
-    // for kBetween, the only two-operand case) - see matchValue's own comment for why this
-    // matters. std::monostate before the first match, same as elemOfTypedCache when empty.
-    mutable bool scalarCached = false;
-    mutable std::variant<std::monostate, bool, std::int64_t, double, std::string> scalarCache0;
-    mutable std::variant<std::monostate, bool, std::int64_t, double, std::string> scalarCache1;
+    // elemOf-family (kElemOf/kNotElemOf) and scalar-family (kLt/kLe/kEq/kNe/kGt/kGe/kBetween)
+    // caches are MUTUALLY EXCLUSIVE by `op` - fixed permanently at construction to one family or
+    // the other, never both - so sharing one storage slot between them avoids paying for a cache
+    // this predicate will never use. This matters a lot here: SubPredicate sits INLINE
+    // (kInlineCapacity = 4, see PredicateList below) inside every Subscription, so its own size
+    // directly multiplies into how many cache lines a whole Subscription spans. Found
+    // 2026-08-30: with this project's own earlier caching additions left as three SEPARATE
+    // fields (an elemOf-only variant, plus two scalar-only ones), SubPredicate reached 208
+    // bytes - 4x that inline pushed a Subscription to 864 bytes (13.5 cache lines), landing
+    // PredicateList's own heap_/size_ bookkeeping (read on EVERY predicate-list access) 840
+    // bytes from the object's start - the direct, measured cause of matchEvent's own dominant
+    // cache-miss cost (see that class's own comment). elemOf-family stores its whole sorted
+    // value list here (one of the four vector alternatives); scalar-family stores its single
+    // vals[0] threshold (one of the four scalar alternatives). std::monostate before the first
+    // match, same meaning either way: "not built yet."
+    mutable bool primaryCached = false;
+    mutable PrimaryCache primaryCache;
+
+    // kBetween's SECOND operand only (vals[1]) - heap-indirected rather than inline, because
+    // kBetween is confirmed dead code in this project's own dialect translation
+    // (pstree_dialect.cpp never constructs it - "X >= lo and X <= hi" always compiles to two
+    // separate kGe/kLe predicates instead, see pst_dynamic.hpp's own comment) - paying a full
+    // cache's worth of inline space on literally every predicate for an operator this project's
+    // real callers never construct wasn't defensible once it was this visibly implicated in a
+    // real regression. Allocated lazily, only if a kBetween predicate is ever actually matched
+    // (see ensureScalarCached) - null for every other predicate, at the cost of one pointer
+    // (8 bytes) instead of a whole ScalarCache (40 bytes) most predicates never touch.
+    mutable std::unique_ptr<ScalarCache> betweenUpperCache;
+
+    // A unique_ptr member makes SubPredicate non-aggregate and non-copyable by default - this
+    // constructor keeps every existing 3-arg brace-init call site (`SubPredicate{attr, op,
+    // vals}`, all over pstree_dialect.cpp and this repo's own tests) working exactly as before,
+    // and the copy operations below deep-copy betweenUpperCache's pointee (rather than the
+    // pointer itself) so a copied predicate doesn't alias or double-free the original's cache -
+    // PredicateList's own copy constructor/assignment (used when a Subscription itself is
+    // copied) relies on SubPredicate being genuinely copyable, not just movable.
+    SubPredicate(std::string attr_, CmpOp op_, std::vector<Value> vals_)
+        : attr(std::move(attr_)), op(op_), vals(std::move(vals_)) {}
+
+    SubPredicate(const SubPredicate& other)
+        : attr(other.attr), op(other.op), vals(other.vals),
+          primaryCached(other.primaryCached), primaryCache(other.primaryCache),
+          betweenUpperCache(other.betweenUpperCache
+                                 ? std::make_unique<ScalarCache>(*other.betweenUpperCache)
+                                 : nullptr) {}
+    SubPredicate& operator=(const SubPredicate& other) {
+        if (this == &other) return *this;
+        attr = other.attr;
+        op = other.op;
+        vals = other.vals;
+        primaryCached = other.primaryCached;
+        primaryCache = other.primaryCache;
+        betweenUpperCache = other.betweenUpperCache
+                                 ? std::make_unique<ScalarCache>(*other.betweenUpperCache)
+                                 : nullptr;
+        return *this;
+    }
+    SubPredicate(SubPredicate&&) noexcept = default;
+    SubPredicate& operator=(SubPredicate&&) noexcept = default;
+    ~SubPredicate() = default;
 };
 
 // Small-vector-optimized storage for a subscription's predicates: real subscriptions almost
@@ -314,7 +365,7 @@ inline const Value* findAttr(const Event& event, std::string_view attr) {
     return nullptr;
 }
 
-// Fills pred.elemOfTypedCache from pred.vals (assumed already sorted by Value's own operator<
+// Fills pred.primaryCache from pred.vals (assumed already sorted by Value's own operator<
 // - see matchValue's kElemOf/kNotElemOf case) - extracting same-index elements in order
 // preserves sortedness for the underlying type too, since std::variant's own ordering for two
 // same-alternative values IS that alternative's own ordering. Empty `vals` leaves the cache as
@@ -327,34 +378,34 @@ inline void buildElemOfTypedCache(const SubPredicate& pred) {
             std::vector<bool> v;
             v.reserve(pred.vals.size());
             for (const auto& x : pred.vals) v.push_back(std::get<bool>(x));
-            pred.elemOfTypedCache = std::move(v);
+            pred.primaryCache = std::move(v);
             return;
         }
         case 1: {
             std::vector<std::int64_t> v;
             v.reserve(pred.vals.size());
             for (const auto& x : pred.vals) v.push_back(std::get<std::int64_t>(x));
-            pred.elemOfTypedCache = std::move(v);
+            pred.primaryCache = std::move(v);
             return;
         }
         case 2: {
             std::vector<double> v;
             v.reserve(pred.vals.size());
             for (const auto& x : pred.vals) v.push_back(std::get<double>(x));
-            pred.elemOfTypedCache = std::move(v);
+            pred.primaryCache = std::move(v);
             return;
         }
         default: {
             std::vector<std::string> v;
             v.reserve(pred.vals.size());
             for (const auto& x : pred.vals) v.push_back(std::get<std::string>(x));
-            pred.elemOfTypedCache = std::move(v);
+            pred.primaryCache = std::move(v);
             return;
         }
     }
 }
 
-// Binary-searches pred.elemOfTypedCache using val's OWN concrete alternative - exactly one
+// Binary-searches pred.primaryCache using val's OWN concrete alternative - exactly one
 // variant-dispatch (std::get<T>(val) below) per call, then a plain std::binary_search over a
 // same-typed std::vector<T> that never touches std::variant again for any of its O(log n)
 // comparisons. If val's type doesn't match what's cached (get_if returns nullptr) this
@@ -367,33 +418,34 @@ inline void buildElemOfTypedCache(const SubPredicate& pred) {
 inline bool elemOfTypedContains(const SubPredicate& pred, const Value& val) {
     switch (val.index()) {
         case 0:
-            if (auto* v = std::get_if<std::vector<bool>>(&pred.elemOfTypedCache)) {
+            if (auto* v = std::get_if<std::vector<bool>>(&pred.primaryCache)) {
                 return std::binary_search(v->begin(), v->end(), std::get<bool>(val));
             }
             return false;
         case 1:
-            if (auto* v = std::get_if<std::vector<std::int64_t>>(&pred.elemOfTypedCache)) {
+            if (auto* v = std::get_if<std::vector<std::int64_t>>(&pred.primaryCache)) {
                 return std::binary_search(v->begin(), v->end(), std::get<std::int64_t>(val));
             }
             return false;
         case 2:
-            if (auto* v = std::get_if<std::vector<double>>(&pred.elemOfTypedCache)) {
+            if (auto* v = std::get_if<std::vector<double>>(&pred.primaryCache)) {
                 return std::binary_search(v->begin(), v->end(), std::get<double>(val));
             }
             return false;
         default:
-            if (auto* v = std::get_if<std::vector<std::string>>(&pred.elemOfTypedCache)) {
+            if (auto* v = std::get_if<std::vector<std::string>>(&pred.primaryCache)) {
                 return std::binary_search(v->begin(), v->end(), std::get<std::string>(val));
             }
             return false;
     }
 }
 
-// Lazily-cached, concretely-typed form of a Value - same shape as elemOfTypedCache but for a
-// single scalar rather than a whole list.
-using ScalarCache = std::variant<std::monostate, bool, std::int64_t, double, std::string>;
-
-inline void cacheScalarValue(const Value& v, ScalarCache& cache) {
+// Extracts v's own concrete alternative into `cache` - works for either ScalarCache (kBetween's
+// upper bound) or PrimaryCache (a scalar-family predicate's own vals[0]), since both variants
+// carry bool/int64_t/double/string as alternatives; the assignment picks whichever alternative
+// the destination variant actually has for that type.
+template <typename CacheVariant>
+inline void cacheScalarValue(const Value& v, CacheVariant& cache) {
     switch (v.index()) {
         case 0: cache = std::get<bool>(v); return;
         case 1: cache = std::get<std::int64_t>(v); return;
@@ -403,13 +455,18 @@ inline void cacheScalarValue(const Value& v, ScalarCache& cache) {
 }
 
 // One-time cache build for the scalar comparison ops (kLt/kLe/kEq/kNe/kGt/kGe/kBetween) -
-// mirrors matchValue's own kElemOf/kNotElemOf lazy-sort-then-cache pattern. kBetween is the
-// only two-operand case, hence scalarCache1.
+// mirrors matchValue's own kElemOf/kNotElemOf lazy-sort-then-cache pattern. vals[0] goes into
+// the shared primaryCache (see SubPredicate's own comment for why it's shared with the elemOf
+// path); kBetween's vals[1] is the only case that also needs betweenUpperCache, allocated here
+// on first use.
 inline void ensureScalarCached(const SubPredicate& pred) {
-    if (pred.scalarCached) return;
-    cacheScalarValue(pred.vals[0], pred.scalarCache0);
-    if (pred.op == CmpOp::kBetween) cacheScalarValue(pred.vals[1], pred.scalarCache1);
-    pred.scalarCached = true;
+    if (pred.primaryCached) return;
+    cacheScalarValue(pred.vals[0], pred.primaryCache);
+    if (pred.op == CmpOp::kBetween) {
+        pred.betweenUpperCache = std::make_unique<ScalarCache>();
+        cacheScalarValue(pred.vals[1], *pred.betweenUpperCache);
+    }
+    pred.primaryCached = true;
 }
 
 // Compares val against an already-cached scalar threshold using `cmp` (std::less<>{},
@@ -421,9 +478,11 @@ inline void ensureScalarCached(const SubPredicate& pred) {
 // on BOTH operands even though a predicate's own threshold type never changes across calls.
 // Same "move dispatch outside the hot path, don't try to make the dispatch itself cheaper"
 // lesson as elemOfTypedContains's own history (two earlier attempts at a cheaper
-// per-comparison dispatch, there, measured slower rather than faster).
-template <typename Cmp>
-inline bool scalarCompare(const Value& val, const ScalarCache& cache, Cmp cmp) {
+// per-comparison dispatch, there, measured slower rather than faster). Templated on the cache's
+// own variant type so it works for both primaryCache (a scalar-family predicate's vals[0]) and
+// *betweenUpperCache (kBetween's vals[1]) without duplicating this switch.
+template <typename Cmp, typename CacheVariant>
+inline bool scalarCompare(const Value& val, const CacheVariant& cache, Cmp cmp) {
     switch (val.index()) {
         case 0: return cmp(std::get<bool>(val), std::get<bool>(cache));
         case 1: return cmp(std::get<std::int64_t>(val), std::get<std::int64_t>(cache));
@@ -468,34 +527,34 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
         case CmpOp::kLt:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::less<>{});
+            return scalarCompare(val, pred.primaryCache, std::less<>{});
         case CmpOp::kLe:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::less_equal<>{});
+            return scalarCompare(val, pred.primaryCache, std::less_equal<>{});
         case CmpOp::kEq:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::equal_to<>{});
+            return scalarCompare(val, pred.primaryCache, std::equal_to<>{});
         case CmpOp::kNe:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return !scalarCompare(val, pred.scalarCache0, std::equal_to<>{});
+            return !scalarCompare(val, pred.primaryCache, std::equal_to<>{});
         case CmpOp::kGt:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::greater<>{});
+            return scalarCompare(val, pred.primaryCache, std::greater<>{});
         case CmpOp::kGe:
             checkSameType(pred.vals.at(0));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::greater_equal<>{});
+            return scalarCompare(val, pred.primaryCache, std::greater_equal<>{});
         case CmpOp::kBetween:
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
             ensureScalarCached(pred);
-            return scalarCompare(val, pred.scalarCache0, std::greater_equal<>{}) &&
-                   scalarCompare(val, pred.scalarCache1, std::less_equal<>{});
-        // Sorts pred.vals AND builds elemOfTypedCache (see both fields' own comments) instead
+            return scalarCompare(val, pred.primaryCache, std::greater_equal<>{}) &&
+                   scalarCompare(val, *pred.betweenUpperCache, std::less_equal<>{});
+        // Sorts pred.vals AND builds primaryCache (see both fields' own comments) instead
         // of a linear std::variant::operator== scan - real values lists here run up to ~128
         // elements (e.g. a `symbol in (...)` set-membership subscription). The one-time sort
         // (and its exhaustive type check, preserving the original per-element checkSameType
@@ -503,19 +562,19 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
         // over every subsequent search against this same predicate; elemOfTypedContains then
         // does the actual O(log n) comparisons on plain typed values, not std::variant ones.
         case CmpOp::kElemOf:
-            if (!pred.elemOfSorted) {
+            if (!pred.primaryCached) {
                 for (const auto& v : pred.vals) checkSameType(v);
                 std::sort(pred.vals.begin(), pred.vals.end());
                 buildElemOfTypedCache(pred);
-                pred.elemOfSorted = true;
+                pred.primaryCached = true;
             }
             return elemOfTypedContains(pred, val);
         case CmpOp::kNotElemOf:
-            if (!pred.elemOfSorted) {
+            if (!pred.primaryCached) {
                 for (const auto& v : pred.vals) checkSameType(v);
                 std::sort(pred.vals.begin(), pred.vals.end());
                 buildElemOfTypedCache(pred);
-                pred.elemOfSorted = true;
+                pred.primaryCached = true;
             }
             return !elemOfTypedContains(pred, val);
         case CmpOp::kIsNull:
