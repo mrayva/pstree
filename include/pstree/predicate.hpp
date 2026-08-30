@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <new>
 #include <stdexcept>
@@ -89,6 +90,14 @@ struct SubPredicate {
     mutable std::variant<std::monostate, std::vector<bool>, std::vector<std::int64_t>,
                           std::vector<double>, std::vector<std::string>>
         elemOfTypedCache;
+
+    // Same principle as elemOfTypedCache, for the scalar comparison ops (kLt/kLe/kEq/kNe/
+    // kGt/kGe/kBetween): a lazily-extracted, concretely-typed copy of vals[0] (and vals[1]
+    // for kBetween, the only two-operand case) - see matchValue's own comment for why this
+    // matters. std::monostate before the first match, same as elemOfTypedCache when empty.
+    mutable bool scalarCached = false;
+    mutable std::variant<std::monostate, bool, std::int64_t, double, std::string> scalarCache0;
+    mutable std::variant<std::monostate, bool, std::int64_t, double, std::string> scalarCache1;
 };
 
 // Small-vector-optimized storage for a subscription's predicates: real subscriptions almost
@@ -380,6 +389,49 @@ inline bool elemOfTypedContains(const SubPredicate& pred, const Value& val) {
     }
 }
 
+// Lazily-cached, concretely-typed form of a Value - same shape as elemOfTypedCache but for a
+// single scalar rather than a whole list.
+using ScalarCache = std::variant<std::monostate, bool, std::int64_t, double, std::string>;
+
+inline void cacheScalarValue(const Value& v, ScalarCache& cache) {
+    switch (v.index()) {
+        case 0: cache = std::get<bool>(v); return;
+        case 1: cache = std::get<std::int64_t>(v); return;
+        case 2: cache = std::get<double>(v); return;
+        default: cache = std::get<std::string>(v); return;
+    }
+}
+
+// One-time cache build for the scalar comparison ops (kLt/kLe/kEq/kNe/kGt/kGe/kBetween) -
+// mirrors matchValue's own kElemOf/kNotElemOf lazy-sort-then-cache pattern. kBetween is the
+// only two-operand case, hence scalarCache1.
+inline void ensureScalarCached(const SubPredicate& pred) {
+    if (pred.scalarCached) return;
+    cacheScalarValue(pred.vals[0], pred.scalarCache0);
+    if (pred.op == CmpOp::kBetween) cacheScalarValue(pred.vals[1], pred.scalarCache1);
+    pred.scalarCached = true;
+}
+
+// Compares val against an already-cached scalar threshold using `cmp` (std::less<>{},
+// std::equal_to<>{}, etc.) - exactly one variant-dispatch (val's own index) per call, then a
+// plain typed comparison, never invoking std::variant's own generic operator<=>. Measured as
+// matchValue's single dominant self-time cost once trade_volume-style range predicates
+// (kGe/kLe on a wide integer domain) were exercised at real scale: every scalar comparison
+// here previously funneled through libstdc++'s synthesized variant<=>, which double-dispatches
+// on BOTH operands even though a predicate's own threshold type never changes across calls.
+// Same "move dispatch outside the hot path, don't try to make the dispatch itself cheaper"
+// lesson as elemOfTypedContains's own history (two earlier attempts at a cheaper
+// per-comparison dispatch, there, measured slower rather than faster).
+template <typename Cmp>
+inline bool scalarCompare(const Value& val, const ScalarCache& cache, Cmp cmp) {
+    switch (val.index()) {
+        case 0: return cmp(std::get<bool>(val), std::get<bool>(cache));
+        case 1: return cmp(std::get<std::int64_t>(val), std::get<std::int64_t>(cache));
+        case 2: return cmp(std::get<double>(val), std::get<double>(cache));
+        default: return cmp(std::get<std::string>(val), std::get<std::string>(cache));
+    }
+}
+
 // Evaluates one predicate against one concrete value. Throws if `val` and `pred`'s own
 // value(s) aren't the same variant alternative - a schema/caller bug (mixing types for the
 // same attribute), not a matching outcome, so it's surfaced loudly rather than silently
@@ -399,26 +451,34 @@ inline bool matchValue(const Value& val, const SubPredicate& pred) {
     switch (pred.op) {
         case CmpOp::kLt:
             checkSameType(pred.vals.at(0));
-            return val < pred.vals[0];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::less<>{});
         case CmpOp::kLe:
             checkSameType(pred.vals.at(0));
-            return val <= pred.vals[0];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::less_equal<>{});
         case CmpOp::kEq:
             checkSameType(pred.vals.at(0));
-            return val == pred.vals[0];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::equal_to<>{});
         case CmpOp::kNe:
             checkSameType(pred.vals.at(0));
-            return !(val == pred.vals[0]);
+            ensureScalarCached(pred);
+            return !scalarCompare(val, pred.scalarCache0, std::equal_to<>{});
         case CmpOp::kGt:
             checkSameType(pred.vals.at(0));
-            return val > pred.vals[0];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::greater<>{});
         case CmpOp::kGe:
             checkSameType(pred.vals.at(0));
-            return val >= pred.vals[0];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::greater_equal<>{});
         case CmpOp::kBetween:
             checkSameType(pred.vals.at(0));
             checkSameType(pred.vals.at(1));
-            return val >= pred.vals[0] && val <= pred.vals[1];
+            ensureScalarCached(pred);
+            return scalarCompare(val, pred.scalarCache0, std::greater_equal<>{}) &&
+                   scalarCompare(val, pred.scalarCache1, std::less_equal<>{});
         // Sorts pred.vals AND builds elemOfTypedCache (see both fields' own comments) instead
         // of a linear std::variant::operator== scan - real values lists here run up to ~128
         // elements (e.g. a `symbol in (...)` set-membership subscription). The one-time sort

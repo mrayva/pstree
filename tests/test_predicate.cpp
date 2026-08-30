@@ -84,6 +84,26 @@ void test_elem_of_with_unsorted_input_and_repeated_calls() {
     require(pstree::matchValue(pstree::Value(std::int64_t{9999}), pNot), "9999 satisfies not-elem-of scrambled list (repeat call)");
 }
 
+// Guards the scalarCache0/scalarCache1 lazy-cache mechanism added 2026-08-29 (see matchValue's
+// own kLt/kLe/kEq/kNe/kGt/kGe cases) - reuses ONE kGe predicate (the exact shape a
+// trade_volume-style "attr >= threshold" range predicate compiles down to) across several
+// calls with DIFFERENT values, some on either side of the threshold and one exactly on it,
+// so a stale or incorrectly-cached comparison would show up as a wrong result on a later
+// call, not just the first (uncached) one.
+void test_scalar_cache_with_repeated_calls() {
+    using pstree::CmpOp;
+    auto p = pred("volume", CmpOp::kGe, {std::int64_t{100}});
+    require(!pstree::matchValue(pstree::Value(std::int64_t{50}), p), "50 !>= 100 (first call, builds cache)");
+    require(pstree::matchValue(pstree::Value(std::int64_t{100}), p), "100 >= 100 (cached, on threshold)");
+    require(pstree::matchValue(pstree::Value(std::int64_t{1000}), p), "1000 >= 100 (cached, well above)");
+    require(!pstree::matchValue(pstree::Value(std::int64_t{99}), p), "99 !>= 100 (cached, just below)");
+
+    auto p2 = pred("price", CmpOp::kLe, {2.5});
+    require(pstree::matchValue(pstree::Value(1.0), p2), "1.0 <= 2.5 (first call, builds cache)");
+    require(pstree::matchValue(pstree::Value(2.5), p2), "2.5 <= 2.5 (cached, on threshold)");
+    require(!pstree::matchValue(pstree::Value(3.0), p2), "3.0 !<= 2.5 (cached, above)");
+}
+
 void test_bool_and_double() {
     using pstree::CmpOp;
     require(pstree::matchValue(pstree::Value(true), pred("flag", CmpOp::kEq, {true})), "true == true");
@@ -158,6 +178,7 @@ void test_is_null_and_is_not_null() {
 int main() {
     test_relational_operators_int();
     test_between();
+    test_scalar_cache_with_repeated_calls();
     test_elem_of_and_not_elem_of();
     test_elem_of_with_unsorted_input_and_repeated_calls();
     test_bool_and_double();
