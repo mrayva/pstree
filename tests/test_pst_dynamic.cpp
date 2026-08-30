@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -556,6 +557,124 @@ void test_two_string_elem_of_predicates_non_access_one_still_correct() {
             "(access or full-verification)");
 }
 
+// Regression for the findAttr-to-index optimization (matchSubscriptionIndexed, see
+// predicate.hpp): a subscription's predicates and an event's own pairs can each list the SAME
+// set of attributes in a DIFFERENT order from each other and from the schema's own declaration
+// order - attrIndex is resolved from the SCHEMA's fixed ordinal, not from either side's own
+// listing order, so this must not matter. Schema declares volume, price, symbol (that order);
+// the subscription's predicates and the event's own pairs both use a scrambled, different order
+// from the schema AND from each other.
+void test_indexed_match_independent_of_attribute_order() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"volume", pstree::ValueType::kInteger, 0},
+        {"price", pstree::ValueType::kFloat, 0},
+        {"symbol", pstree::ValueType::kString, 16},
+    };
+    pstree::PSTDynamic pstd(schema);
+    // Predicates listed symbol, volume, price - none of these match the schema's own order.
+    pstree::Subscription sub{
+        1, {pstree::SubPredicate{"symbol", pstree::CmpOp::kEq, {std::string("AAPL")}},
+            pstree::SubPredicate{"volume", pstree::CmpOp::kGe, {std::int64_t{100}}},
+            pstree::SubPredicate{"price", pstree::CmpOp::kLe, {50.0}}}};
+    pstd.insertSubscription(sub);
+
+    // Event pairs listed price, symbol, volume - yet a THIRD order, different from both the
+    // schema and the subscription's own predicate order.
+    pstree::Event matching = {{"price", pstree::Value(25.0)},
+                               {"symbol", pstree::Value(std::string("AAPL"))},
+                               {"volume", pstree::Value(std::int64_t{200})}};
+    require(pstd.matchEvent(matching).size() == 1, "all three predicates satisfied should match regardless of attribute order anywhere");
+
+    pstree::Event nonMatching = {{"price", pstree::Value(25.0)},
+                                  {"symbol", pstree::Value(std::string("MSFT"))},
+                                  {"volume", pstree::Value(std::int64_t{200})}};
+    require(pstd.matchEvent(nonMatching).empty(), "symbol mismatch should still correctly fail regardless of attribute order");
+}
+
+// Regression for matchSubscriptionIndexed's own "attribute absent from this event" path
+// (indexed[i] == nullptr) - the indexed equivalent of findAttr() returning nullptr.
+void test_indexed_match_missing_event_attribute() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"volume", pstree::ValueType::kInteger, 0},
+        {"symbol", pstree::ValueType::kString, 16},
+    };
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{
+        1, {pstree::SubPredicate{"volume", pstree::CmpOp::kGe, {std::int64_t{100}}},
+            pstree::SubPredicate{"symbol", pstree::CmpOp::kEq, {std::string("AAPL")}}}};
+    pstd.insertSubscription(sub);
+
+    // Event has volume but not symbol at all - the subscription's symbol predicate must fail
+    // the whole match, exactly like matchSubscription()'s own documented "absent attribute
+    // always fails" rule.
+    pstree::Event partial = {{"volume", pstree::Value(std::int64_t{500})}};
+    require(pstd.matchEvent(partial).empty(), "an event missing an attribute a predicate needs should not match");
+}
+
+// Regression for kIsNull/kIsNotNull through matchSubscriptionIndexed specifically (both are
+// intercepted before ever reaching matchValue, on both the name-based and indexed paths - this
+// confirms the indexed path's own interception is correct, not just inherited by construction).
+void test_indexed_match_is_null_is_not_null() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"code", pstree::ValueType::kInteger, 0},
+        {"discount", pstree::ValueType::kInteger, 0},
+    };
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription subNotNull{
+        1, {pstree::SubPredicate{"code", pstree::CmpOp::kEq, {std::int64_t{1}}},
+            pstree::SubPredicate{"discount", pstree::CmpOp::kIsNotNull, {}}}};
+    pstd.insertSubscription(subNotNull);
+
+    require(pstd.matchEvent({{"code", pstree::Value(std::int64_t{1})},
+                             {"discount", pstree::Value(std::int64_t{5})}})
+                .size() == 1,
+            "code=1 with discount present should match kIsNotNull");
+    require(pstd.matchEvent({{"code", pstree::Value(std::int64_t{1})}}).empty(),
+            "code=1 with discount absent should NOT match kIsNotNull");
+}
+
+// Direct differential test between the two match functions themselves (predicate.hpp), isolated
+// from PSTDynamic entirely - the most direct correctness guarantee for matchSubscriptionIndexed:
+// for the SAME logical event/subscription, expressed both ways (name-based Event vs. an indexed
+// array), the two functions must agree.
+void test_match_subscription_indexed_agrees_with_name_based() {
+    pstree::Subscription sub{
+        1, {pstree::SubPredicate{"a", pstree::CmpOp::kGe, {std::int64_t{10}}},
+            pstree::SubPredicate{"b", pstree::CmpOp::kEq, {std::string("x")}}}};
+    for (auto& pred : sub.predicates) pstree::ensurePredicateCachedForInsert(pred);
+    // Schema ordinal: a=0, b=1, c=2 (c unused by this subscription, present to exercise a
+    // nullptr slot in `indexed` that this subscription never reads).
+    sub.predicates[0].attrIndex = 0;
+    sub.predicates[1].attrIndex = 1;
+
+    auto check = [&](std::optional<std::int64_t> aVal, std::optional<std::string> bVal, bool expected,
+                      const std::string& label) {
+        pstree::Event event;
+        std::vector<const pstree::Value*> indexed(3, nullptr);
+        pstree::Value aStorage, bStorage;
+        if (aVal) {
+            aStorage = pstree::Value(*aVal);
+            event.push_back({"a", aStorage});
+            indexed[0] = &aStorage;
+        }
+        if (bVal) {
+            bStorage = pstree::Value(*bVal);
+            event.push_back({"b", bStorage});
+            indexed[1] = &bStorage;
+        }
+        bool nameBased = pstree::matchSubscription(event, sub);
+        bool indexBased = pstree::matchSubscriptionIndexed(indexed, sub);
+        require(nameBased == indexBased, label + ": matchSubscription/matchSubscriptionIndexed disagreed");
+        require(nameBased == expected, label + ": unexpected result");
+    };
+
+    check(15, std::string("x"), true, "both satisfied");
+    check(5, std::string("x"), false, "a fails (below threshold)");
+    check(15, std::string("y"), false, "b fails (wrong string)");
+    check(std::nullopt, std::string("x"), false, "a absent from event entirely");
+    check(15, std::nullopt, false, "b absent from event entirely");
+}
+
 } // namespace
 
 int main() {
@@ -576,6 +695,10 @@ int main() {
     test_string_ordering_predicate_rejected();
     test_string_ordering_predicate_rejected_when_not_the_access_predicate();
     test_two_string_elem_of_predicates_non_access_one_still_correct();
+    test_indexed_match_independent_of_attribute_order();
+    test_indexed_match_missing_event_attribute();
+    test_indexed_match_is_null_is_not_null();
+    test_match_subscription_indexed_agrees_with_name_based();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";

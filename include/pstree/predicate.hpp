@@ -75,9 +75,28 @@ using PrimaryCache = std::variant<std::monostate, std::vector<bool>, std::vector
                                    std::vector<double>, std::vector<std::string>,
                                    bool, std::int64_t, double, std::string>;
 
+// Sentinel meaning "this predicate's attribute is not part of any known schema" - the same
+// case findAttr()/an absent event attribute already handles as "never matches" (see
+// matchSubscriptionIndexed's own comment), just reached via an out-of-range index instead of a
+// null pointer.
+inline constexpr std::size_t kNoAttrIndex = static_cast<std::size_t>(-1);
+
 struct SubPredicate {
     std::string attr;
     CmpOp op;
+    // Resolved ONCE, at insert time (PSTDynamic::insertSubscription, alongside string
+    // interning and cache-building - see that function's own comment), to this predicate's
+    // attribute's ordinal position in its schema (PSTDynamic::dimensions_' own per-dimension
+    // `index` - see DimensionIndex). Lets matchSubscriptionIndexed() below look up this
+    // predicate's event value by O(1) array index instead of findAttr()'s linear name scan -
+    // found via `perf` (2026-08-30) to be a real, comparable-in-size cost next to std::variant's
+    // own dispatch overhead, at the call volume real subscription counts produce (once per
+    // predicate, per candidate subscription, per event). kNoAttrIndex (the default) means
+    // "not resolved" - either this predicate was never inserted through PSTDynamic at all (a
+    // predicate built for direct matchValue()/matchSubscription() testing, which never uses
+    // this field), or its attribute isn't in the schema (mirrors findAttr() returning nullptr
+    // for the same case - both mean "never matches").
+    mutable std::size_t attrIndex = kNoAttrIndex;
     // mutable: matchValue() lazily sorts this in place (once, on the first kElemOf/kNotElemOf
     // match - see matchValue()'s own comment) so it can binary_search a large value list
     // instead of a linear scan. The SET of values a predicate holds never changes this way,
@@ -129,7 +148,7 @@ struct SubPredicate {
         : attr(std::move(attr_)), op(op_), vals(std::move(vals_)) {}
 
     SubPredicate(const SubPredicate& other)
-        : attr(other.attr), op(other.op), vals(other.vals),
+        : attr(other.attr), op(other.op), vals(other.vals), attrIndex(other.attrIndex),
           primaryCached(other.primaryCached), primaryCache(other.primaryCache),
           betweenUpperCache(other.betweenUpperCache
                                  ? std::make_unique<ScalarCache>(*other.betweenUpperCache)
@@ -139,6 +158,7 @@ struct SubPredicate {
         attr = other.attr;
         op = other.op;
         vals = other.vals;
+        attrIndex = other.attrIndex;
         primaryCached = other.primaryCached;
         primaryCache = other.primaryCache;
         betweenUpperCache = other.betweenUpperCache
@@ -648,6 +668,45 @@ inline bool matchSubscription(const Event& event, const Subscription& sub) {
         // kIsNull/kIsNotNull test presence itself, not a value comparison - intercepted
         // here, before the "absent attribute always fails" rule below would otherwise
         // incorrectly reject kIsNull for exactly the case it's meant to accept.
+        if (pred.op == CmpOp::kIsNull) {
+            if (val != nullptr) return false;
+            continue;
+        }
+        if (pred.op == CmpOp::kIsNotNull) {
+            if (val == nullptr) return false;
+            continue;
+        }
+        if (val == nullptr) return false;
+        if (!matchValue(*val, pred)) return false;
+    }
+    return true;
+}
+
+// Same matching semantics as matchSubscription() above (identical logic, byte for byte) but
+// looks up each predicate's event value via O(1) array index (pred.attrIndex, resolved once at
+// insert time - see SubPredicate's own comment) instead of findAttr()'s O(event size) name
+// scan. `indexed` is a schema-sized array where indexed[i] is the Value for whichever event
+// attribute has ordinal `i` (PSTDynamic::DimensionIndex::index), or nullptr if that attribute
+// is absent from this particular event - built ONCE per matchEvent() call (see that function's
+// own comment) and reused across every candidate subscription checked against that event,
+// which is the whole point: findAttr()'s per-(predicate, candidate) cost was real at the call
+// volume real subscription counts produce, even though each individual call was cheap.
+//
+// Deliberately a separate function, not a parameter-swapped overload of matchSubscription:
+// this project's whole differential-testing discipline (test_pst_dynamic_stress.cpp's own
+// brute-force oracle, in particular) depends on matchSubscription/findAttr/Event staying the
+// simple, obviously-correct, schema-agnostic reference implementation, completely unchanged and
+// untouched by this optimization - a real bug in matchSubscriptionIndexed shows up as a genuine
+// mismatch against that untouched oracle, not something both sides could coincidentally share.
+//
+// pred.attrIndex may legitimately be kNoAttrIndex (this predicate's attribute isn't in the
+// schema this indexed array was built from, or this predicate was never inserted through
+// PSTDynamic at all) or >= indexed.size() - both correctly fall through to `val == nullptr`
+// below via the bounds check, exactly mirroring findAttr() returning nullptr for an absent
+// attribute.
+inline bool matchSubscriptionIndexed(const std::vector<const Value*>& indexed, const Subscription& sub) {
+    for (const auto& pred : sub.predicates) {
+        const Value* val = (pred.attrIndex < indexed.size()) ? indexed[pred.attrIndex] : nullptr;
         if (pred.op == CmpOp::kIsNull) {
             if (val != nullptr) return false;
             continue;

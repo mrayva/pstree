@@ -315,12 +315,13 @@ inline std::vector<std::string> dimSigDimensions(const Subscription& sub) {
 class PSTDynamic {
 public:
     explicit PSTDynamic(std::vector<AttrSchema> schema) {
-        for (auto& s : schema) {
+        for (std::size_t i = 0; i < schema.size(); ++i) {
+            AttrSchema& s = schema[i];
             std::string name = s.name;
             if (s.type == ValueType::kString && !s.stringIntern) {
                 s.stringIntern = std::make_shared<StringInternTable>();
             }
-            dimensions_.try_emplace(name, std::move(s));
+            dimensions_.try_emplace(name, std::move(s), i);
         }
     }
 
@@ -414,6 +415,9 @@ public:
             auto predDimIt = dimensions_.find(pred.attr);
             if (predDimIt == dimensions_.end()) continue; // unknown dimension - rejected below if selected
             DimensionIndex& predDim = predDimIt->second;
+            // Resolved from the SAME lookup already needed for interning/cardinality-tracking
+            // below - no extra hashmap hit. See SubPredicate::attrIndex's own comment.
+            pred.attrIndex = predDim.index;
             if (predDim.schema.type == ValueType::kString) {
                 // Ordering predicates against a string-typed dimension have no valid meaning
                 // under interning (interned ids are NOT order-preserving w.r.t. the original
@@ -530,13 +534,26 @@ public:
         // predicate PS-Tree itself indexes - see insertSubscription's own comment for the other
         // half of this (why the STORED subscription needs its OTHER predicates interned too,
         // not just its access predicate).
+        //
+        // `indexed` is built in the SAME pass, for the same "pay once per event attribute,
+        // amortize across every candidate subscription" reason: indexed[i] is the Value for
+        // whichever event attribute has ordinal `i` (DimensionIndex::index), or nullptr if
+        // this event doesn't have that attribute at all - see matchSubscriptionIndexed's own
+        // comment in predicate.hpp for why this replaces findAttr()'s per-(predicate,
+        // candidate) name scan with an O(1) array read. Local to this call, never shared
+        // across matchEvent() invocations or threads - see StringInternTable's own comment for
+        // why a shared mutable scratch buffer here would reintroduce the exact class of race
+        // just fixed (found via `perf`, 2026-08-30: real, comparable in size to std::variant's
+        // own dispatch overhead at real subscription counts).
         Event internedEvent = event;
+        std::vector<const Value*> indexed(dimensions_.size(), nullptr);
         for (auto& pair : internedEvent) {
             auto dimIt = dimensions_.find(pair.attr);
             if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
             if (dimIt->second.schema.type == ValueType::kString) {
                 pair.val = Value(dimIt->second.schema.stringIntern->lookupForSearch(std::get<std::string>(pair.val)));
             }
+            indexed[dimIt->second.index] = &pair.val;
         }
 
         std::vector<std::string> eventDims;
@@ -561,7 +578,7 @@ public:
                 for (auto& [groupSig, ids] : state.groups) {
                     if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
                     for (auto& [id, subPtr] : ids) {
-                        if (matchSubscription(internedEvent, *subPtr)) {
+                        if (matchSubscriptionIndexed(indexed, *subPtr)) {
                             matchingSubs.push_back(id);
                         }
                     }
@@ -661,9 +678,15 @@ private:
     static void destroyLeafGroupState(void* p) { delete static_cast<LeafGroupState*>(p); }
 
     struct DimensionIndex {
-        explicit DimensionIndex(AttrSchema s)
-            : schema(std::move(s)), tree(detail::shapeFor(schema), destroyLeafGroupState) {}
+        DimensionIndex(AttrSchema s, std::size_t idx)
+            : schema(std::move(s)), index(idx), tree(detail::shapeFor(schema), destroyLeafGroupState) {}
         AttrSchema schema;
+        // This dimension's fixed ordinal among every attribute in the schema PSTDynamic was
+        // constructed with (0-based, in the order the caller's own AttrSchema vector listed
+        // them) - assigned once, at construction, never reassigned. Lets matchEvent() build a
+        // plain array indexed by this value (see that function's own comment) instead of every
+        // predicate-vs-candidate check doing a name-based lookup.
+        std::size_t index;
         PSTree tree;
         // Distinct literal values ever referenced by ANY predicate on this dimension, across
         // every subscription ever inserted (see insertSubscription's own comment for why - not
