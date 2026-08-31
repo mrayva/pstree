@@ -70,10 +70,12 @@
 // list) - flagged in the repo README as follow-up work, not assumed solved.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -314,7 +316,29 @@ inline std::vector<std::string> dimSigDimensions(const Subscription& sub) {
 
 class PSTDynamic {
 public:
+    // Generous, fixed upper bound on schema size. Two independent things depend on it fitting
+    // in a small range: matchEvent() builds its per-call `indexed` lookup array (see that
+    // function's own comment) on the stack instead of via a heap allocation, and
+    // SubPredicate::attrIndex (predicate.hpp) is a uint8_t, not a size_t, specifically so
+    // adding it didn't grow SubPredicate's own size at all (see that field's own comment for
+    // why that mattered - a real, measured throughput regression, isolated by testing the
+    // heap-vs-stack array question SEPARATELY from the struct-size question: switching
+    // matchEvent's `indexed` from std::vector to this fixed std::array did NOT recover the
+    // regression on its own, but shrinking attrIndex from size_t to uint8_t did - the array
+    // itself was kept anyway, since avoiding a per-event heap allocation is a real
+    // improvement even though it wasn't the confirmed cause here). Enforced once, at
+    // construction (below) - every real schema this project uses (2-10 attributes) sits far
+    // under this bound; raise it (and attrIndex's own type, if it would no longer fit a
+    // uint8_t) if a future one ever needs more.
+    static constexpr std::size_t kMaxSchemaAttrs = 32;
+
     explicit PSTDynamic(std::vector<AttrSchema> schema) {
+        if (schema.size() > kMaxSchemaAttrs) {
+            throw std::invalid_argument(
+                "pstree: schema has " + std::to_string(schema.size()) +
+                " attributes, more than kMaxSchemaAttrs (" + std::to_string(kMaxSchemaAttrs) +
+                ") - raise the bound in pst_dynamic.hpp if a real schema ever needs that many");
+        }
         for (std::size_t i = 0; i < schema.size(); ++i) {
             AttrSchema& s = schema[i];
             std::string name = s.name;
@@ -417,7 +441,7 @@ public:
             DimensionIndex& predDim = predDimIt->second;
             // Resolved from the SAME lookup already needed for interning/cardinality-tracking
             // below - no extra hashmap hit. See SubPredicate::attrIndex's own comment.
-            pred.attrIndex = predDim.index;
+            pred.attrIndex = static_cast<std::uint8_t>(predDim.index);
             if (predDim.schema.type == ValueType::kString) {
                 // Ordering predicates against a string-typed dimension have no valid meaning
                 // under interning (interned ids are NOT order-preserving w.r.t. the original
@@ -545,8 +569,11 @@ public:
         // why a shared mutable scratch buffer here would reintroduce the exact class of race
         // just fixed (found via `perf`, 2026-08-30: real, comparable in size to std::variant's
         // own dispatch overhead at real subscription counts).
+        // dimensions_.size() <= kMaxSchemaAttrs is a permanent, whole-lifetime invariant,
+        // enforced once in the constructor - no runtime check needed on this per-event path.
         Event internedEvent = event;
-        std::vector<const Value*> indexed(dimensions_.size(), nullptr);
+        std::array<const Value*, kMaxSchemaAttrs> indexedStorage{};
+        std::span<const Value*> indexed(indexedStorage.data(), dimensions_.size());
         for (auto& pair : internedEvent) {
             auto dimIt = dimensions_.find(pair.attr);
             if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error

@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <memory>
 #include <new>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -78,8 +79,20 @@ using PrimaryCache = std::variant<std::monostate, std::vector<bool>, std::vector
 // Sentinel meaning "this predicate's attribute is not part of any known schema" - the same
 // case findAttr()/an absent event attribute already handles as "never matches" (see
 // matchSubscriptionIndexed's own comment), just reached via an out-of-range index instead of a
-// null pointer.
-inline constexpr std::size_t kNoAttrIndex = static_cast<std::size_t>(-1);
+// null pointer. std::uint8_t (not std::size_t) is deliberate, not just a size micro-opt: a
+// naive first version used std::size_t (8 bytes) and measured a real THROUGHPUT REGRESSION
+// (K=32000, `perf_search_loop`, ~15-18%) despite eliminating a real, profiler-confirmed cost -
+// isolated by reverting the actual matchSubscriptionIndexed() usage while keeping the field,
+// which did NOT recover the regression, pointing at struct SIZE (not the new lookup logic
+// itself) as the cause. SubPredicate sits INLINE (x4, see PredicateList) inside every
+// Subscription, so its own size directly multiplies into cache lines touched per candidate -
+// this project's own prior history (see this struct's own primaryCache/primaryCache comment)
+// already found this exact mechanism once. A uint8_t here comfortably covers
+// PSTDynamic::kMaxSchemaAttrs (32) with massive headroom, and - critically - fits inside
+// padding this struct's own layout already had (after `op`, before `vals`'s own 8-byte
+// alignment requirement), so it costs ZERO additional bytes: sizeof(SubPredicate) is back to
+// its pre-this-change value.
+inline constexpr std::uint8_t kNoAttrIndex = static_cast<std::uint8_t>(-1);
 
 struct SubPredicate {
     std::string attr;
@@ -95,8 +108,9 @@ struct SubPredicate {
     // "not resolved" - either this predicate was never inserted through PSTDynamic at all (a
     // predicate built for direct matchValue()/matchSubscription() testing, which never uses
     // this field), or its attribute isn't in the schema (mirrors findAttr() returning nullptr
-    // for the same case - both mean "never matches").
-    mutable std::size_t attrIndex = kNoAttrIndex;
+    // for the same case - both mean "never matches"). See kNoAttrIndex's own comment for why
+    // this is uint8_t, not size_t.
+    mutable std::uint8_t attrIndex = kNoAttrIndex;
     // mutable: matchValue() lazily sorts this in place (once, on the first kElemOf/kNotElemOf
     // match - see matchValue()'s own comment) so it can binary_search a large value list
     // instead of a linear scan. The SET of values a predicate holds never changes this way,
@@ -704,7 +718,7 @@ inline bool matchSubscription(const Event& event, const Subscription& sub) {
 // PSTDynamic at all) or >= indexed.size() - both correctly fall through to `val == nullptr`
 // below via the bounds check, exactly mirroring findAttr() returning nullptr for an absent
 // attribute.
-inline bool matchSubscriptionIndexed(const std::vector<const Value*>& indexed, const Subscription& sub) {
+inline bool matchSubscriptionIndexed(std::span<const Value* const> indexed, const Subscription& sub) {
     for (const auto& pred : sub.predicates) {
         const Value* val = (pred.attrIndex < indexed.size()) ? indexed[pred.attrIndex] : nullptr;
         if (pred.op == CmpOp::kIsNull) {
