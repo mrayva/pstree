@@ -254,6 +254,68 @@ void test_individual_subscription_matches() {
     }
 }
 
+// Native DECIMAL32/64/128/256 support: kDecimal dimension coverage mirroring the per-type
+// pattern every other ValueType already gets in this file - equality, all four ordering ops,
+// kBetween, kElemOf/kNotElemOf. Values here are already-scaled Int256s (as if rescaled to this
+// attribute's own AttrSchema::decimalScale by the caller - pstree itself never rescales, see
+// that field's own comment), built from plain int64_t via sign-extension so the test stays
+// readable without hand-writing 256-bit literals.
+void test_decimal_predicates() {
+    using pstree::CmpOp;
+    auto dec = [](std::int64_t v) {
+        pstree::Int256 r;
+        std::uint64_t bits = static_cast<std::uint64_t>(v);
+        std::uint64_t fill = (v < 0) ? ~std::uint64_t{0} : std::uint64_t{0};
+        r.limb = {bits, fill, fill, fill};
+        return r;
+    };
+
+    std::vector<pstree::AttrSchema> schema = {
+        {"amount", pstree::ValueType::kDecimal, 0, nullptr, 2}, // canonical scale 2 (e.g. cents)
+    };
+    pstree::PSTDynamic pstd(schema);
+
+    pstree::Subscription eq{1, {P("amount", CmpOp::kEq, {pstree::Value(dec(12345))})}};
+    pstree::Subscription lt{2, {P("amount", CmpOp::kLt, {pstree::Value(dec(0))})}};
+    pstree::Subscription le{3, {P("amount", CmpOp::kLe, {pstree::Value(dec(-100))})}};
+    pstree::Subscription gt{4, {P("amount", CmpOp::kGt, {pstree::Value(dec(1000000))})}};
+    pstree::Subscription ge{5, {P("amount", CmpOp::kGe, {pstree::Value(dec(1000000))})}};
+    pstree::Subscription between{6, {P("amount", CmpOp::kBetween, {pstree::Value(dec(100)), pstree::Value(dec(200))})}};
+    pstree::Subscription elemOf{7, {P("amount", CmpOp::kElemOf,
+        {pstree::Value(dec(7)), pstree::Value(dec(9)), pstree::Value(dec(11))})}};
+    pstree::Subscription notElemOf{8, {P("amount", CmpOp::kNotElemOf,
+        {pstree::Value(dec(7)), pstree::Value(dec(9)), pstree::Value(dec(11))})}};
+
+    for (auto* s : {&eq, &lt, &le, &gt, &ge, &between, &elemOf, &notElemOf}) pstd.insertSubscription(*s);
+
+    auto matchAmount = [&](std::int64_t v) {
+        pstree::Event e = {{"amount", pstree::Value(dec(v))}};
+        return pstd.matchEvent(e);
+    };
+
+    { auto m = matchAmount(12345); require(contains(m, 1), "decimal eq matches 12345"); }
+    { auto m = matchAmount(0); require(!contains(m, 1), "decimal eq should not match 0");
+      require(!contains(m, 2), "decimal lt(0) is strict, should not match 0 itself"); }
+    // Sign-boundary: values differing only in sign, equal magnitude - a real risk spot for a
+    // fixed-point two's-complement encoding the way -0.0/+0.0 was for DoubleCodec.
+    { auto m = matchAmount(-1); require(contains(m, 2), "decimal lt(0) matches -1 (sign boundary)"); }
+    { auto m = matchAmount(1); require(!contains(m, 2), "decimal lt(0) should not match +1"); }
+    { auto m = matchAmount(-100); require(contains(m, 3), "decimal le(-100) matches -100 itself"); }
+    { auto m = matchAmount(-101); require(contains(m, 3), "decimal le(-100) matches -101"); }
+    { auto m = matchAmount(-99); require(!contains(m, 3), "decimal le(-100) should not match -99"); }
+    { auto m = matchAmount(1000001); require(contains(m, 4), "decimal gt(1000000) matches 1000001");
+      require(contains(m, 5), "decimal ge(1000000) matches 1000001"); }
+    { auto m = matchAmount(1000000); require(!contains(m, 4), "decimal gt(1000000) should not match itself");
+      require(contains(m, 5), "decimal ge(1000000) matches itself"); }
+    { auto m = matchAmount(150); require(contains(m, 6), "decimal between(100,200) matches 150"); }
+    { auto m = matchAmount(99); require(!contains(m, 6), "decimal between(100,200) should not match 99"); }
+    { auto m = matchAmount(201); require(!contains(m, 6), "decimal between(100,200) should not match 201"); }
+    { auto m = matchAmount(9); require(contains(m, 7), "decimal elemOf matches 9");
+      require(!contains(m, 8), "decimal notElemOf should not match 9"); }
+    { auto m = matchAmount(10); require(!contains(m, 7), "decimal elemOf should not match 10");
+      require(contains(m, 8), "decimal notElemOf matches 10"); }
+}
+
 // Delete lifecycle: deleting S4 should remove it from future matches without disturbing S3
 // (which shares S4's access-predicate leaf and, plausibly, its dimension-signature group).
 void test_delete_subscription() {
@@ -683,6 +745,7 @@ int main() {
     test_delete_uses_stored_access_predicate_not_a_recomputed_one();
     test_section_5_3_event_matching();
     test_individual_subscription_matches();
+    test_decimal_predicates();
     test_delete_subscription();
     test_elem_of_access_predicate();
     test_ne_only_access_predicate_fallback();

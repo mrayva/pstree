@@ -30,6 +30,7 @@ void require(bool cond, const std::string& message) {
 struct Dim {
     std::string name;
     pstree::ValueType type;
+    std::int32_t decimalScale = 0; // meaningful only for type == kDecimal
 };
 
 std::vector<Dim> makeDims() {
@@ -45,12 +46,18 @@ std::vector<Dim> makeDims() {
         // by this test's randomized insert/delete/match differential checking, not just by the
         // one hand-crafted regression test in test_pst_dynamic.cpp.
         {"s_narrow", pstree::ValueType::kString}, {"s_wide", pstree::ValueType::kString},
+        // Native DECIMAL32/64/128/256 support: two dims with DIFFERENT canonical scales, folded
+        // into the same randomized insert/delete/match differential every other type already
+        // gets - a real bug in Int256Codec's multi-limb encoding, or in predicate.hpp's new
+        // kDecimal dispatch, would show up here as a genuine mismatch against the brute-force
+        // oracle, not something both sides could coincidentally share.
+        {"d0", pstree::ValueType::kDecimal, 2}, {"d1", pstree::ValueType::kDecimal, 4},
     };
 }
 
 std::vector<pstree::AttrSchema> makeSchema(const std::vector<Dim>& dims) {
     std::vector<pstree::AttrSchema> schema;
-    for (auto& d : dims) schema.push_back({d.name, d.type, 8});
+    for (auto& d : dims) schema.push_back({d.name, d.type, 8, nullptr, d.decimalScale});
     return schema;
 }
 
@@ -78,6 +85,32 @@ pstree::Value randomValue(const Dim& dim, std::mt19937& rng) {
             std::uniform_int_distribution<int> d(0, 4);
             static const char* words[] = {"aa", "bb", "cc", "dd", "ee"};
             return pstree::Value(std::string(words[d(rng)]));
+        }
+        case pstree::ValueType::kDecimal: {
+            // ~40% boundary values (min/max/zero/+-1 - the multi-limb-carry-heavy extremes),
+            // ~60% ordinary small values sign-extended into all 4 limbs - a mix of both matters
+            // here: boundaries alone would rarely produce interesting kBetween/ordering overlap
+            // between two random values, and normal-range-only would never exercise the
+            // multi-limb carry/borrow logic this type's own encoding uniquely has.
+            std::uniform_int_distribution<int> pick(0, 9);
+            pstree::Int256 v{};
+            switch (pick(rng)) {
+                case 0: v.limb = {0, 0, 0, std::uint64_t{1} << 63}; break; // min
+                case 1: v.limb = {~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0},
+                                   std::uint64_t{0x7FFFFFFFFFFFFFFF}}; break; // max
+                case 2: v.limb = {0, 0, 0, 0}; break; // zero
+                case 3: v.limb = {1, 0, 0, 0}; break; // +1
+                case 4: v.limb = {~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0},
+                                   ~std::uint64_t{0}}; break; // -1
+                default: {
+                    std::uniform_int_distribution<std::int64_t> d(-1000, 1000);
+                    std::int64_t iv = d(rng);
+                    std::uint64_t bits = static_cast<std::uint64_t>(iv);
+                    std::uint64_t fill = (iv < 0) ? ~std::uint64_t{0} : std::uint64_t{0};
+                    v.limb = {bits, fill, fill, fill};
+                }
+            }
+            return pstree::Value(v);
         }
     }
     return pstree::Value(std::int64_t{0});

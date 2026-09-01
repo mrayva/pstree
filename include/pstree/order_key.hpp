@@ -21,6 +21,7 @@
 // upper PSTDynamic layer exactly as Section 4.5 intends.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "pstree/int256.hpp"
 
 namespace pstree {
 
@@ -226,6 +229,39 @@ inline std::uint64_t unchunk64(const ElementKey& elems, std::size_t bits_per_chu
     return key;
 }
 
+// Same technique as chunk64/unchunk64, generalized across the four 64-bit limbs of an Int256
+// (most-significant LIMB first, matching chunk64's own most-significant-CHUNK-first order
+// within one limb) instead of a single 64-bit key - each limb contributes 64/bits_per_chunk
+// chunks. Shared by Int256Codec below.
+inline ElementKey chunk256(const std::array<std::uint64_t, 4>& limbs, std::size_t bits_per_chunk) {
+    std::size_t chunks_per_limb = 64 / bits_per_chunk;
+    ElementKey out(chunks_per_limb * limbs.size());
+    std::size_t idx = 0;
+    for (std::size_t li = limbs.size(); li-- > 0;) {
+        std::uint64_t limb = limbs[li];
+        for (std::size_t i = 0; i < chunks_per_limb; ++i) {
+            std::size_t shift = (chunks_per_limb - 1 - i) * bits_per_chunk;
+            std::uint64_t mask = (bits_per_chunk >= 64) ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits_per_chunk) - 1);
+            out[idx++] = static_cast<std::uint16_t>((limb >> shift) & mask);
+        }
+    }
+    return out;
+}
+
+inline std::array<std::uint64_t, 4> unchunk256(const ElementKey& elems, std::size_t bits_per_chunk) {
+    std::array<std::uint64_t, 4> limbs{};
+    std::size_t chunks_per_limb = 64 / bits_per_chunk;
+    std::size_t idx = 0;
+    for (std::size_t li = limbs.size(); li-- > 0;) {
+        std::uint64_t limb = 0;
+        for (std::size_t i = 0; i < chunks_per_limb; ++i) {
+            limb = (limb << bits_per_chunk) | static_cast<std::uint64_t>(elems[idx++]);
+        }
+        limbs[li] = limb;
+    }
+    return limbs;
+}
+
 } // namespace detail
 
 // --- boolean: degenerate 1-element, 2-value case ---
@@ -296,6 +332,40 @@ struct DoubleCodec {
         std::uint64_t bits = sortable ^ mask;
         double v;
         std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+};
+
+// --- Int256 (native DECIMAL32/64/128/256 support): sign-flip trick on the top limb only,
+// 64 x 4-bit elements (4 limbs x 16 chunks/limb, same radix-16 convention Int64Codec/DoubleCodec
+// already use). This EXCEEDS ElementKey::kInlineCapacity (16) - a decimal dimension's keys always
+// spill to ElementKey's heap path (accepted for phase 1 rather than widening kInlineCapacity
+// system-wide, which would cost every int64/double/bool key too for a case with no benchmark
+// evidence yet that it matters - see the project plan this was built from). ---
+
+struct Int256Codec {
+    static constexpr std::size_t kBitsPerChunk = 4;
+    static constexpr std::size_t kChunksPerLimb = 64 / kBitsPerChunk; // 16
+    static constexpr std::size_t kChunks = kChunksPerLimb * 4;        // 64
+
+    static KeyShape shape() { return KeyShape{std::vector<std::uint32_t>(kChunks, 1u << kBitsPerChunk)}; }
+
+    static ElementKey encode(const Int256& v) {
+        // Only the most-significant limb's own top bit carries the two's-complement sign -
+        // flipping just that one bit (not each limb independently) is enough to make the whole
+        // 4-limb pattern, chunked most-significant-limb-first, sort correctly as an unsigned
+        // 256-bit integer - see Int256::operator< 's own comment for why this is valid across
+        // multiple limbs, not just within one.
+        std::array<std::uint64_t, 4> limbs = v.limb;
+        limbs[3] ^= (std::uint64_t{1} << 63);
+        return detail::chunk256(limbs, kBitsPerChunk);
+    }
+
+    static Int256 decode(const ElementKey& e) {
+        std::array<std::uint64_t, 4> limbs = detail::unchunk256(e, kBitsPerChunk);
+        limbs[3] ^= (std::uint64_t{1} << 63);
+        Int256 v;
+        v.limb = limbs;
         return v;
     }
 };

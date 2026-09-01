@@ -28,6 +28,8 @@
 #include <variant>
 #include <vector>
 
+#include "pstree/int256.hpp"
+
 namespace pstree {
 
 // Section 2.1's full operator set. kBetween is the paper's own "in" (SQL BETWEEN, [lo,hi]
@@ -63,18 +65,30 @@ enum class CmpOp {
 // consistently, across every subscription and event that references it (the same
 // assumption a-tree/be-tree make; not re-validated per-call here, see matchValue()'s own
 // doc comment for what happens if a caller violates it).
-using Value = std::variant<bool, std::int64_t, double, std::string>;
+//
+// Int256 (appended LAST, not inserted alongside bool/int64_t/double) backs native
+// DECIMAL32/64/128/256 support - already a raw, canonically-scaled integer magnitude by the
+// time it reaches here (see int256.hpp's own comment for where rescaling actually happens).
+// Appended last deliberately: every existing index-based `switch (v.index())` in this file
+// (buildElemOfTypedCache/elemOfTypedContains/cacheScalarValue/scalarCompare) used `default:`
+// for the string case before this change - inserting a new alternative in the MIDDLE would
+// silently renumber string to a different index and make every one of those `default:` arms
+// wrong in a way that still compiles. Appending last means each of those switches needed an
+// explicit new `case 4:` anyway (done below) rather than relying on `default:` picking up the
+// new case by accident.
+using Value = std::variant<bool, std::int64_t, double, std::string, Int256>;
 
 // Lazily-cached, concretely-typed form of a single Value - used for kBetween's second operand
 // (see SubPredicate::betweenUpperCache below).
-using ScalarCache = std::variant<std::monostate, bool, std::int64_t, double, std::string>;
+using ScalarCache = std::variant<std::monostate, bool, std::int64_t, double, std::string, Int256>;
 
 // Lazily-cached, concretely-typed form of EITHER an elemOf-family predicate's whole (sorted)
 // value list OR a scalar-family predicate's single vals[0] threshold - see SubPredicate's own
 // comment for why these two share one variant instead of each getting their own.
 using PrimaryCache = std::variant<std::monostate, std::vector<bool>, std::vector<std::int64_t>,
                                    std::vector<double>, std::vector<std::string>,
-                                   bool, std::int64_t, double, std::string>;
+                                   std::vector<Int256>,
+                                   bool, std::int64_t, double, std::string, Int256>;
 
 // Sentinel meaning "this predicate's attribute is not part of any known schema" - the same
 // case findAttr()/an absent event attribute already handles as "never matches" (see
@@ -429,10 +443,17 @@ inline void buildElemOfTypedCache(const SubPredicate& pred) {
             pred.primaryCache = std::move(v);
             return;
         }
-        default: {
+        case 3: {
             std::vector<std::string> v;
             v.reserve(pred.vals.size());
             for (const auto& x : pred.vals) v.push_back(std::get<std::string>(x));
+            pred.primaryCache = std::move(v);
+            return;
+        }
+        case 4: {
+            std::vector<Int256> v;
+            v.reserve(pred.vals.size());
+            for (const auto& x : pred.vals) v.push_back(std::get<Int256>(x));
             pred.primaryCache = std::move(v);
             return;
         }
@@ -466,12 +487,18 @@ inline bool elemOfTypedContains(const SubPredicate& pred, const Value& val) {
                 return std::binary_search(v->begin(), v->end(), std::get<double>(val));
             }
             return false;
-        default:
+        case 3:
             if (auto* v = std::get_if<std::vector<std::string>>(&pred.primaryCache)) {
                 return std::binary_search(v->begin(), v->end(), std::get<std::string>(val));
             }
             return false;
+        case 4:
+            if (auto* v = std::get_if<std::vector<Int256>>(&pred.primaryCache)) {
+                return std::binary_search(v->begin(), v->end(), std::get<Int256>(val));
+            }
+            return false;
     }
+    return false;
 }
 
 // Extracts v's own concrete alternative into `cache` - works for either ScalarCache (kBetween's
@@ -484,7 +511,8 @@ inline void cacheScalarValue(const Value& v, CacheVariant& cache) {
         case 0: cache = std::get<bool>(v); return;
         case 1: cache = std::get<std::int64_t>(v); return;
         case 2: cache = std::get<double>(v); return;
-        default: cache = std::get<std::string>(v); return;
+        case 3: cache = std::get<std::string>(v); return;
+        case 4: cache = std::get<Int256>(v); return;
     }
 }
 
@@ -521,8 +549,10 @@ inline bool scalarCompare(const Value& val, const CacheVariant& cache, Cmp cmp) 
         case 0: return cmp(std::get<bool>(val), std::get<bool>(cache));
         case 1: return cmp(std::get<std::int64_t>(val), std::get<std::int64_t>(cache));
         case 2: return cmp(std::get<double>(val), std::get<double>(cache));
-        default: return cmp(std::get<std::string>(val), std::get<std::string>(cache));
+        case 3: return cmp(std::get<std::string>(val), std::get<std::string>(cache));
+        case 4: return cmp(std::get<Int256>(val), std::get<Int256>(cache));
     }
+    return false;
 }
 
 // Builds this predicate's ENTIRE comparison cache from its own literal values alone (no event

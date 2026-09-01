@@ -90,7 +90,7 @@
 
 namespace pstree {
 
-enum class ValueType { kBoolean, kInteger, kFloat, kString };
+enum class ValueType { kBoolean, kInteger, kFloat, kString, kDecimal };
 
 // String interning for PS-Tree indexing: this project's shared expression grammar (confirmed by
 // reading be-tree's own parser.y directly - num_comp_value, the value type behind </<=/>/>=, is
@@ -175,6 +175,15 @@ struct AttrSchema {
     // copied in places that must all observe the SAME table for a given dimension, not each get
     // their own.
     std::shared_ptr<StringInternTable> stringIntern;
+    // Meaningful only when type == kDecimal: the ONE canonical scale every Int256 Value reaching
+    // this dimension is already rescaled to, by whichever caller constructs it (event population,
+    // or literal promotion in nats_sidecar's own dialect translation) - never carried per-value
+    // (see int256.hpp's own comment for the size-budget reason). If two source columns feeding
+    // this same logical attribute declare different scales, the caller must pick one canonical
+    // scale wide enough for both and rescale every value up to it before it ever becomes a
+    // pstree::Value - pstree's own comparison/encoding code never rescales and never sees a scale
+    // at all, exactly like kInteger today.
+    std::int32_t decimalScale = 0;
 };
 
 namespace detail {
@@ -185,6 +194,7 @@ inline KeyShape shapeFor(const AttrSchema& schema) {
         case ValueType::kInteger: return Int64Codec::shape();
         case ValueType::kFloat: return DoubleCodec::shape();
         case ValueType::kString: return Int64Codec::shape(); // interned id, see StringInternTable
+        case ValueType::kDecimal: return Int256Codec::shape();
     }
     throw std::logic_error("pstree: unreachable ValueType in shapeFor");
 }
@@ -193,7 +203,9 @@ inline KeyShape shapeFor(const AttrSchema& schema) {
 // the interned std::int64_t id (see this file's own top comment for exactly where that
 // interning happens - insertSubscription/matchEvent, never here) - this function itself no
 // longer knows or cares whether a dimension is "logically" a string; once interned, kString and
-// kInteger are representationally identical, sharing Int64Codec.
+// kInteger are representationally identical, sharing Int64Codec. For kDecimal, `v` MUST already
+// hold an Int256 rescaled to schema.decimalScale (see AttrSchema::decimalScale's own comment) -
+// this function doesn't rescale, it only encodes.
 inline ElementKey encodeValue(const Value& v, const AttrSchema& schema) {
     switch (schema.type) {
         case ValueType::kBoolean: return BoolCodec::encode(std::get<bool>(v));
@@ -201,6 +213,7 @@ inline ElementKey encodeValue(const Value& v, const AttrSchema& schema) {
         case ValueType::kString:
             return Int64Codec::encode(std::get<std::int64_t>(v));
         case ValueType::kFloat: return DoubleCodec::encode(std::get<double>(v));
+        case ValueType::kDecimal: return Int256Codec::encode(std::get<Int256>(v));
     }
     throw std::logic_error("pstree: unreachable ValueType in encodeValue");
 }
@@ -216,6 +229,14 @@ inline ElementKey minKeyFor(const AttrSchema& schema) {
         case ValueType::kString:
             return Int64Codec::encode(std::numeric_limits<std::int64_t>::min());
         case ValueType::kFloat: return DoubleCodec::encode(-std::numeric_limits<double>::infinity());
+        case ValueType::kDecimal: {
+            // All-zero-bits two's-complement minimum representable Int256 (limb[3]'s top bit
+            // set, every other bit 0) - the same "smallest bit pattern the codec's own sign-flip
+            // trick can produce" convention Int64Codec's own minKeyFor entry already relies on.
+            Int256 minVal;
+            minVal.limb = {0, 0, 0, std::uint64_t{1} << 63};
+            return Int256Codec::encode(minVal);
+        }
     }
     throw std::logic_error("pstree: unreachable ValueType in minKeyFor");
 }

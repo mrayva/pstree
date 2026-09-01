@@ -108,6 +108,97 @@ void test_double_nan_rejected() {
     require(threw, "encoding NaN should throw std::invalid_argument");
 }
 
+// Int256: same round-trip/order properties as int64/double, but exercised specifically at
+// multi-limb boundaries (values differing only in the lowest limb vs. only in the highest limb,
+// and the carry/borrow cases below) - a single-limb type has no equivalent of these, and
+// Int256Codec's own multi-limb chunk256/unchunk256 (order_key.hpp) is new code with no prior
+// coverage from int64/double's own tests.
+void test_int256_round_trip_and_order() {
+    auto mk = [](std::uint64_t l0, std::uint64_t l1, std::uint64_t l2, std::uint64_t l3) {
+        pstree::Int256 v;
+        v.limb = {l0, l1, l2, l3};
+        return v;
+    };
+    const std::uint64_t kSignBit = std::uint64_t{1} << 63;
+    std::vector<pstree::Int256> values = {
+        mk(0, 0, 0, kSignBit),                                          // most negative representable
+        mk(1, 0, 0, kSignBit),                                          // most negative + 1
+        mk(~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}), // -1
+        mk(0, 0, 0, 0),                                                 // 0
+        mk(1, 0, 0, 0),                                                 // 1
+        mk(5, 0, 0, 0),                                                 // differs from next only in limb[0]
+        mk(6, 0, 0, 0),
+        mk(0, 0, 0, 5),                                                 // differs from next only in limb[3] (high limb)
+        mk(0, 0, 0, 6),
+        mk(~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}, std::uint64_t{0x7FFFFFFFFFFFFFFF}), // max
+    };
+    for (const auto& v : values) {
+        auto key = pstree::Int256Codec::encode(v);
+        require(pstree::Int256Codec::decode(key) == v, "Int256 round-trip");
+    }
+    // Order property against a manually-sorted subset spanning the interesting boundaries.
+    std::vector<pstree::Int256> ordered = {
+        mk(0, 0, 0, kSignBit),                                          // min
+        mk(1, 0, 0, kSignBit),                                          // min + 1
+        mk(~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}), // -1
+        mk(0, 0, 0, 0),                                                 // 0
+        mk(1, 0, 0, 0),                                                 // 1
+        mk(5, 0, 0, 0),
+        mk(6, 0, 0, 0),
+        mk(0, 0, 0, 5),                                                 // >> 6*2^64 range, far larger than limb[0]=6
+        mk(0, 0, 0, 6),
+        mk(~std::uint64_t{0}, ~std::uint64_t{0}, ~std::uint64_t{0}, std::uint64_t{0x7FFFFFFFFFFFFFFF}), // max
+    };
+    require(ordered[0] < ordered[1], "Int256 native operator< sanity: min < min+1");
+    for (std::size_t i = 0; i + 1 < ordered.size(); ++i) {
+        require(ordered[i] < ordered[i + 1], "Int256 native operator< monotonic at index " + std::to_string(i));
+        auto ka = pstree::Int256Codec::encode(ordered[i]);
+        auto kb = pstree::Int256Codec::encode(ordered[i + 1]);
+        require(lexLess(ka, kb), "Int256 encoded order at index " + std::to_string(i));
+    }
+}
+
+// Carry/borrow propagation across ALL THREE multi-limb boundaries (limb[0]->limb[1],
+// limb[1]->limb[2], limb[2]->limb[3]) - a single-limb type only ever has one boundary
+// (the sign-changing one, already covered for int64 above); Int256 has three additional ones
+// nextElementKey/prevElementKey's own generic mixed-radix stepping must get right.
+void test_int256_multilimb_carry_borrow() {
+    auto mk = [](std::uint64_t l0, std::uint64_t l1, std::uint64_t l2, std::uint64_t l3) {
+        pstree::Int256 v;
+        v.limb = {l0, l1, l2, l3};
+        return v;
+    };
+    const std::uint64_t kMaxLimb = ~std::uint64_t{0};
+    struct Boundary { pstree::Int256 v, expectedNext, expectedPrevOfNext; const char* label; };
+    std::vector<Boundary> boundaries = {
+        {mk(kMaxLimb, 0, 0, 0), mk(0, 1, 0, 0), mk(kMaxLimb, 0, 0, 0), "limb0->limb1 carry"},
+        {mk(kMaxLimb, kMaxLimb, 0, 0), mk(0, 0, 1, 0), mk(kMaxLimb, kMaxLimb, 0, 0), "limb1->limb2 carry"},
+        {mk(kMaxLimb, kMaxLimb, kMaxLimb, 0), mk(0, 0, 0, 1), mk(kMaxLimb, kMaxLimb, kMaxLimb, 0), "limb2->limb3 carry"},
+    };
+    for (const auto& b : boundaries) {
+        auto key = pstree::Int256Codec::encode(b.v);
+        auto next = pstree::nextElementKey(pstree::Int256Codec::shape(), key);
+        require(next.has_value(), std::string("next() should exist: ") + b.label);
+        require(pstree::Int256Codec::decode(*next) == b.expectedNext,
+                std::string("next() carries correctly: ") + b.label);
+        auto backAgain = pstree::prevElementKey(pstree::Int256Codec::shape(), *next);
+        require(backAgain.has_value(), std::string("prev(next()) should exist: ") + b.label);
+        require(pstree::Int256Codec::decode(*backAgain) == b.expectedPrevOfNext,
+                std::string("prev(next()) borrows back correctly: ") + b.label);
+    }
+    // True overflow/underflow at the representable extremes, same shape as int64's own test.
+    {
+        pstree::Int256 maxVal = mk(kMaxLimb, kMaxLimb, kMaxLimb, std::uint64_t{0x7FFFFFFFFFFFFFFF});
+        auto kMax = pstree::Int256Codec::encode(maxVal);
+        require(!pstree::nextElementKey(pstree::Int256Codec::shape(), kMax).has_value(),
+                "next(Int256 max) should not exist");
+        pstree::Int256 minVal = mk(0, 0, 0, std::uint64_t{1} << 63);
+        auto kMin = pstree::Int256Codec::encode(minVal);
+        require(!pstree::prevElementKey(pstree::Int256Codec::shape(), kMin).has_value(),
+                "prev(Int256 min) should not exist");
+    }
+}
+
 // nextElementKey/prevElementKey: ordinary mixed-radix increment/decrement, generic across
 // every codec's own KeyShape - exercised directly here (rather than only indirectly via
 // PS-Tree's kGt/kLt) so a bug in the stepping logic itself isn't masked by tree behavior.
@@ -160,6 +251,8 @@ int main() {
     test_string_codec();
     test_double_negative_zero();
     test_double_nan_rejected();
+    test_int256_round_trip_and_order();
+    test_int256_multilimb_carry_borrow();
     test_adjacent_key_stepping();
 
     if (g_failures > 0) {
