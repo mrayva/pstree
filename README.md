@@ -37,8 +37,19 @@ leaves - a small, per-attribute-type constant (16 for int64/double, <=128 for st
 of how many other predicates exist on that dimension. **This supersedes the paper's own Algorithms
 1-3 for range operators specifically** - not a transcription anymore, a from-scratch fix for a real,
 measured limitation of that design (equality and the overall PSTDynamic layer - access-predicate
-selection, dimension-signature grouping - are unaffected and unchanged). See
-`mrayva/nats_sidecar`'s own README for the re-measured benchmark numbers after this fix.
+selection, dimension-signature grouping - are unaffected and unchanged).
+
+**Re-measured, and the search side needed two further fixes of its own** (see
+`mrayva/nats_sidecar`'s own README, "K-scaling investigation" section, for the full derivation):
+the insert-side fix above didn't touch `MatchEvent`'s own O(group-size)-per-event cost, which still
+blew up at K=8000 single-attribute-degenerate subscriptions (`avg_match_us` 76.6µs, ~500x the K=1
+baseline). Two follow-up match-time fixes - skipping a subscription's own access-predicate
+re-verification once `matchPoint()`'s tree walk already proves it exactly (85d40ea), then inlining
+the hot per-candidate fields directly into `LeafGroupState::groups` to avoid a cache-miss pointer
+chase found via `perf annotate` (55dbd2b) - brought `avg_match_us` down to a measured 9.79µs
+(~7.8x cumulative) and true sustained throughput up to ~620-635 rows/s at K=8000. Real, verified,
+shipped - but still ~1,600x short of even a relaxed 1M rows/s bar for this specific workload shape;
+not further pursued past this point without new direction.
 
 **Phase 1 complete**: the PS-Tree index itself (`InsertPredicate`, `MatchPoint`,
 `DeletePredicate` - originally a transcription of the paper's own Algorithms 1-3, now superseded
