@@ -587,10 +587,14 @@ public:
         auto lowLevel = buildLowLevel(dim, accPred);
         std::vector<LeafNode*> leafNodes = applyLowLevel(dim, lowLevel, /*insert=*/true);
 
+        // Built from the SAME accIdx/accIdxSkippable locals already computed above (not
+        // re-derived from subPtr) - see GroupEntry's own comment for why that matters.
+        bool onlyPredicateIsAccess = subPtr->sub.predicates.size() == 1;
+
         for (LeafNode* leaf : leafNodes) {
             LeafGroupState& state = groupStateFor(leaf);
             DimSig sig = calculateDimSig(subDims, state.dimSigLen);
-            state.groups[sig].emplace_back(sub.id, subPtr);
+            state.groups[sig].push_back(GroupEntry{sub.id, subPtr, accIdx, accIdxSkippable, onlyPredicateIsAccess});
             state.subNum += 1;
             if (state.subNum >= detail::growThreshold(state.dimSigLen)) {
                 state.dimSigLen += 1;
@@ -662,20 +666,28 @@ public:
                 DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
                 for (auto& [groupSig, ids] : state.groups) {
                     if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
-                    for (auto& [id, subPtr] : ids) {
-                        // Only skip the access predicate's own re-check when it's one of the
-                        // operators buildLowLevel gives a real, value-specific tree placement to
-                        // (accIdxSkippable, computed once at insert time - see
-                        // accessPredicateProvenExactlyByTreeMembership's own comment). kNe/
-                        // kNotElemOf/kIsNotNull instead get a "matches every leaf" catch-all
-                        // there, so reaching this leaf proves nothing about them - the sentinel
-                        // index (sub.predicates.size(), never a valid predicate index) means
-                        // "skip nothing," falling back to the full per-predicate check.
-                        std::size_t skipIdx = subPtr->accIdxSkippable
-                            ? subPtr->accIdx : subPtr->sub.predicates.size();
+                    for (auto& entry : ids) {
+                        // Fast path: a single-predicate subscription whose sole predicate IS the
+                        // (skippable) access predicate is fully proven by matchPoint()'s own tree
+                        // walk alone - reached with ZERO dereference into subPtr/subscriptions_ at
+                        // all (see GroupEntry's own comment for why that dereference was, until
+                        // this change, the single hottest instruction in this whole function).
+                        if (entry.accIdxSkippable && entry.onlyPredicateIsAccess) {
+                            matchingSubs.push_back(entry.id);
+                            continue;
+                        }
+                        // Otherwise fall back to the full per-predicate check, skipping only the
+                        // access predicate's own re-check when it's one of the operators
+                        // buildLowLevel gives a real, value-specific tree placement to
+                        // (accIdxSkippable). kNe/kNotElemOf/kIsNotNull instead get a "matches
+                        // every leaf" catch-all there, so reaching this leaf proves nothing about
+                        // them - the sentinel index (sub.predicates.size(), never a valid
+                        // predicate index) means "skip nothing," falling back to the full check.
+                        std::size_t skipIdx = entry.accIdxSkippable
+                            ? entry.accIdx : entry.subPtr->sub.predicates.size();
                         if (matchSubscriptionIndexedSkippingAccessPredicate(
-                                indexed, subPtr->sub, skipIdx)) {
-                            matchingSubs.push_back(id);
+                                indexed, entry.subPtr->sub, skipIdx)) {
+                            matchingSubs.push_back(entry.id);
                         }
                     }
                 }
@@ -716,7 +728,7 @@ public:
             }
             auto& ids = groupIt->second;
             auto idIt = std::find_if(ids.begin(), ids.end(),
-                                      [subId](const auto& entry) { return entry.first == subId; });
+                                      [subId](const auto& entry) { return entry.id == subId; });
             if (idIt == ids.end()) {
                 throw std::logic_error("pstree: subscription id missing from its own group on delete");
             }
@@ -759,6 +771,11 @@ private:
     // further down (see its own comment) - it's the value type of subscriptions_, paired with
     // the access-predicate index InsertSubscription chose for it.
     struct StoredSubscription;
+    // Forward-declared for the same reason: LeafGroupState::groups needs the full GroupEntry type
+    // (stored by value, not just a pointer, so its hot fields are contiguous - see its own
+    // comment further down), but GroupEntry itself only needs a StoredSubscription* member, so
+    // both can stay forward-declared here and fully defined together afterward.
+    struct GroupEntry;
 
     struct LeafGroupState {
         std::size_t dimSigLen = detail::kInitialDimSigLen;
@@ -774,12 +791,11 @@ private:
         // InsertSubscription's and DeleteSubscription's own comments for why the ordering
         // guarantees a pointer is never read here after its target is erased.
         //
-        // Points at the whole StoredSubscription (not just its `.sub` field) so MatchEvent's own
-        // hot loop can read `accIdx` back too, alongside the subscription itself - see
-        // matchSubscriptionIndexedSkippingAccessPredicate's own comment (predicate.hpp) for why
-        // that's needed: matchPoint()'s own tree walk already exactly proves the access
-        // predicate, so re-checking it again per candidate is pure wasted work at scale.
-        std::unordered_map<DimSig, std::vector<std::pair<std::uint64_t, const StoredSubscription*>>, DimSig::Hasher> groups;
+        // Each entry is a GroupEntry (see its own comment): id + subPtr (for the multi-predicate
+        // path) PLUS accIdx/accIdxSkippable/onlyPredicateIsAccess inlined directly here, so
+        // MatchEvent's hot loop can decide whether it even needs to dereference subPtr at all
+        // without first chasing a pointer into subscriptions_'s own scattered heap storage.
+        std::unordered_map<DimSig, std::vector<GroupEntry>, DimSig::Hasher> groups;
     };
 
     static void destroyLeafGroupState(void* p) { delete static_cast<LeafGroupState*>(p); }
@@ -816,6 +832,27 @@ private:
         // the CHOSEN access predicate's own op) and cached here, same convention as accIdx itself
         // - see that function's own comment for exactly which operators this covers and why.
         bool accIdxSkippable;
+    };
+
+    // One leaf-group's-worth of candidate info for MatchEvent's own hot loop, inlined directly
+    // into LeafGroupState::groups (see that field's own comment) instead of just a bare
+    // (id, StoredSubscription*) pair. Found via `perf annotate --symbol=PSTDynamic::matchEvent`
+    // on a real K=8000 fleet trial (2026-09): once the access-predicate re-check itself was
+    // skipped (see accIdxSkippable/matchSubscriptionIndexedSkippingAccessPredicate), the single
+    // hottest instruction left in the whole function (80%+ of its self-time) was the READ of
+    // `subPtr->accIdxSkippable` itself - a cache miss, not compute, since `subPtr` chases into
+    // subscriptions_ (an unordered_map), whose entries sit scattered across the heap unrelated to
+    // this vector's own iteration order. Duplicating accIdx/accIdxSkippable here (write-once, from
+    // the SAME locals already used to build the StoredSubscription they mirror - never re-derived
+    // from subPtr later, so there's no divergence risk) makes the common case - a single-predicate
+    // subscription whose sole predicate IS the access predicate, exactly the shape wide-range
+    // degenerate benchmarks use - a linear, cache-friendly scan with subPtr never touched at all.
+    struct GroupEntry {
+        std::uint64_t id;
+        const StoredSubscription* subPtr; // only dereferenced on the multi-predicate path below
+        std::size_t accIdx;
+        bool accIdxSkippable;
+        bool onlyPredicateIsAccess; // sub.predicates.size() == 1
     };
 
     // Returns this leaf's LeafGroupState, allocating one on first touch.
@@ -919,14 +956,17 @@ private:
     // (ReorganizeGroups is referenced by name only) - this is the natural, only-sensible
     // implementation of what it must do given the rest of Algorithm 4/6's own description.
     void reorganizeGroups(LeafGroupState& state) {
-        std::vector<std::pair<std::uint64_t, const StoredSubscription*>> allSubs;
+        std::vector<GroupEntry> allSubs;
         for (auto& [sig, ids] : state.groups) {
             allSubs.insert(allSubs.end(), ids.begin(), ids.end());
         }
         state.groups.clear();
-        for (auto& [id, subPtr] : allSubs) {
-            DimSig sig = calculateDimSig(detail::dimSigDimensions(subPtr->sub), state.dimSigLen);
-            state.groups[sig].emplace_back(id, subPtr);
+        // Every field GroupEntry carries (accIdx/accIdxSkippable/onlyPredicateIsAccess) was
+        // already computed once at insert time and never changes - re-hashing by DimSig is a
+        // pure regrouping, so entries are copied whole rather than recomputed.
+        for (auto& entry : allSubs) {
+            DimSig sig = calculateDimSig(detail::dimSigDimensions(entry.subPtr->sub), state.dimSigLen);
+            state.groups[sig].push_back(entry);
         }
     }
 
