@@ -737,6 +737,65 @@ void test_match_subscription_indexed_agrees_with_name_based() {
     check(15, std::nullopt, false, "b absent from event entirely");
 }
 
+// Direct unit test for matchSubscriptionIndexedSkippingAccessPredicate (predicate.hpp) - the
+// Phase 3 optimization skipping a subscription's own access predicate at match time, since
+// PSTree::matchPoint() already exactly proved it (see that function's own comment for the full
+// argument, and PSTDynamic::detail::accessPredicateProvenExactlyByTreeMembership for exactly
+// which operators this applies to). Confirms: (1) skipping index i truly ignores predicate i's
+// own condition, even when the event's actual value would fail it - proving the skip is real, not
+// accidentally still checking; (2) skipping the out-of-range sentinel (size()) behaves identically
+// to the full matchSubscriptionIndexed check on every predicate; (3) a single-predicate
+// subscription with its sole predicate skipped unconditionally returns true.
+void test_match_subscription_indexed_skipping_access_predicate() {
+    pstree::Subscription sub{
+        1, {pstree::SubPredicate{"a", pstree::CmpOp::kGe, {std::int64_t{10}}},
+            pstree::SubPredicate{"b", pstree::CmpOp::kEq, {std::string("x")}}}};
+    for (auto& pred : sub.predicates) pstree::ensurePredicateCachedForInsert(pred);
+    sub.predicates[0].attrIndex = 0;
+    sub.predicates[1].attrIndex = 1;
+
+    pstree::Value aFail(std::int64_t{5});   // fails "a >= 10"
+    pstree::Value bFail(std::string("y"));  // fails "b == x"
+    pstree::Value aPass(std::int64_t{15});
+    pstree::Value bPass(std::string("x"));
+    std::vector<const pstree::Value*> indexedBothFail{&aFail, &bFail};
+    std::vector<const pstree::Value*> indexedBothPass{&aPass, &bPass};
+    std::vector<const pstree::Value*> indexedAFailBPass{&aFail, &bPass};
+    std::vector<const pstree::Value*> indexedAPassBFail{&aPass, &bFail};
+
+    // Skipping index 0 (the failing "a") must still return true, since only "b" gets checked.
+    require(pstree::matchSubscriptionIndexedSkippingAccessPredicate(indexedAFailBPass, sub, 0),
+            "skipping a's own failing predicate must ignore it, b alone passes");
+    // Skipping index 1 (the failing "b") must still return true, since only "a" gets checked.
+    require(pstree::matchSubscriptionIndexedSkippingAccessPredicate(indexedAPassBFail, sub, 1),
+            "skipping b's own failing predicate must ignore it, a alone passes");
+    // Skipping a passing predicate changes nothing observable here - still true either way.
+    require(pstree::matchSubscriptionIndexedSkippingAccessPredicate(indexedBothPass, sub, 0),
+            "both pass regardless of which is skipped");
+
+    // Sentinel (out-of-range index) must behave identically to the full check on every case.
+    for (auto* indexed : {&indexedBothFail, &indexedBothPass, &indexedAFailBPass, &indexedAPassBFail}) {
+        bool full = pstree::matchSubscriptionIndexed(*indexed, sub);
+        bool skipNothing = pstree::matchSubscriptionIndexedSkippingAccessPredicate(
+            *indexed, sub, sub.predicates.size());
+        require(full == skipNothing, "sentinel skip-index must agree with the full check");
+    }
+    require(!pstree::matchSubscriptionIndexedSkippingAccessPredicate(indexedBothFail, sub, sub.predicates.size()),
+            "sentinel skip-index with both predicates failing must still return false");
+
+    // A single-predicate subscription with its sole (skipped) predicate must unconditionally
+    // return true, regardless of the event's actual value on that attribute.
+    pstree::Subscription single{2, {pstree::SubPredicate{"a", pstree::CmpOp::kGt, {std::int64_t{1000}}}}};
+    for (auto& pred : single.predicates) pstree::ensurePredicateCachedForInsert(pred);
+    single.predicates[0].attrIndex = 0;
+    pstree::Value aWayBelow(std::int64_t{-999}); // would fail "a > 1000" if actually checked
+    std::vector<const pstree::Value*> indexedSingle{&aWayBelow};
+    require(pstree::matchSubscriptionIndexedSkippingAccessPredicate(indexedSingle, single, 0),
+            "single-predicate subscription with its sole predicate skipped must return true unconditionally");
+    require(!pstree::matchSubscriptionIndexed(indexedSingle, single),
+            "sanity check: the FULL check on the same data must actually fail (proves the skip is doing real work)");
+}
+
 } // namespace
 
 int main() {
@@ -762,6 +821,7 @@ int main() {
     test_indexed_match_missing_event_attribute();
     test_indexed_match_is_null_is_not_null();
     test_match_subscription_indexed_agrees_with_name_based();
+    test_match_subscription_indexed_skipping_access_predicate();
 
     if (g_failures > 0) {
         std::cerr << g_failures << " test(s) failed\n";

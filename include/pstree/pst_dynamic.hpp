@@ -258,6 +258,39 @@ inline int opRank(CmpOp op) {
     return 6;
 }
 
+// True iff, when `op` is the CHOSEN access predicate, PSTree::matchPoint() reaching this
+// subscription's bucket is an EXACT proof of the predicate's own condition - i.e. it's safe for
+// MatchEvent's hot loop to skip re-verifying it via matchSubscriptionIndexedSkippingAccessPredicate
+// (predicate.hpp). Matches buildLowLevel's own switch exactly (pst_dynamic.hpp, further down):
+// kLt/kLe/kEq/kGt/kGe/kBetween/kElemOf all insert a real, value-specific Op::kEq/kGe/kLe/kIn
+// predicate there - reaching the resulting bucket genuinely proves the condition. kNe/kNotElemOf/
+// kIsNotNull instead insert a "matches every leaf" catch-all (Op::kGe from the domain minimum -
+// see buildLowLevel's own comment on those three cases), since a negation has no indexable narrow
+// region at all: reaching that bucket proves nothing but "this dimension is present," and the
+// real condition is ONLY ever checked by the full re-verification - skipping it for these three
+// would silently turn "not X" into "matches everything," a real, caught regression
+// (test_pst_dynamic.cpp's own kNotElemOf/kNe cases) during this function's own development.
+// kIsNull can never be the chosen access predicate at all (selectAccPredIndex/insertSubscription
+// reject it) - included here only so the switch stays exhaustive, never actually reached this way.
+inline bool accessPredicateProvenExactlyByTreeMembership(CmpOp op) {
+    switch (op) {
+        case CmpOp::kEq:
+        case CmpOp::kElemOf:
+        case CmpOp::kBetween:
+        case CmpOp::kLt:
+        case CmpOp::kLe:
+        case CmpOp::kGt:
+        case CmpOp::kGe:
+            return true;
+        case CmpOp::kNotElemOf:
+        case CmpOp::kNe:
+        case CmpOp::kIsNotNull:
+        case CmpOp::kIsNull:
+            return false;
+    }
+    return false;
+}
+
 // Smaller = more selective. Only meaningful within the same rank tier (Section 2.3: "When
 // the operators have the same values, we consider predicates with wider value sets to have
 // lower selectivity"). Operators with no natural width always return 0 (a tie, falling
@@ -519,10 +552,12 @@ public:
         }
 
         std::size_t accIdx = selectAccPredIndex(interned);
-        const std::string& accAttr = interned.predicates.at(accIdx).attr;
+        const SubPredicate& chosenAccPred = interned.predicates.at(accIdx);
+        const std::string& accAttr = chosenAccPred.attr;
         if (dimensions_.find(accAttr) == dimensions_.end()) {
             throw std::invalid_argument("pstree: unknown dimension '" + accAttr + "'");
         }
+        bool accIdxSkippable = detail::accessPredicateProvenExactlyByTreeMembership(chosenAccPred.op);
         std::vector<std::string> subDims = detail::dimSigDimensions(interned);
 
         // Stored BEFORE the leaf loop below, not after: reorganizeGroups() (triggered by
@@ -539,12 +574,14 @@ public:
         // `sub.id` (not `interned.id`) as the map key/id, for clarity - both are identical since
         // `interned` is a straight copy of `sub` with only predicate VALUES rewritten.
         auto [subIt, subInserted] =
-            subscriptions_.emplace(sub.id, StoredSubscription{std::move(interned), accIdx});
-        const Subscription* subPtr = &subIt->second.sub;
+            subscriptions_.emplace(sub.id, StoredSubscription{std::move(interned), accIdx, accIdxSkippable});
+        // Points at the whole entry (sub + accIdx), not just its `.sub` field - see
+        // LeafGroupState::groups' own comment for why MatchEvent's hot loop needs accIdx too.
+        const StoredSubscription* subPtr = &subIt->second;
         // Re-bound from the STORED (moved-into) copy, not the now-moved-from local `interned` -
         // both hold the identical interned values either way, this just avoids reading through
         // a moved-from object.
-        const SubPredicate& accPred = subPtr->predicates.at(accIdx);
+        const SubPredicate& accPred = subPtr->sub.predicates.at(accIdx);
         DimensionIndex& dim = dimensions_.at(accPred.attr);
 
         auto lowLevel = buildLowLevel(dim, accPred);
@@ -626,7 +663,18 @@ public:
                 for (auto& [groupSig, ids] : state.groups) {
                     if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
                     for (auto& [id, subPtr] : ids) {
-                        if (matchSubscriptionIndexed(indexed, *subPtr)) {
+                        // Only skip the access predicate's own re-check when it's one of the
+                        // operators buildLowLevel gives a real, value-specific tree placement to
+                        // (accIdxSkippable, computed once at insert time - see
+                        // accessPredicateProvenExactlyByTreeMembership's own comment). kNe/
+                        // kNotElemOf/kIsNotNull instead get a "matches every leaf" catch-all
+                        // there, so reaching this leaf proves nothing about them - the sentinel
+                        // index (sub.predicates.size(), never a valid predicate index) means
+                        // "skip nothing," falling back to the full per-predicate check.
+                        std::size_t skipIdx = subPtr->accIdxSkippable
+                            ? subPtr->accIdx : subPtr->sub.predicates.size();
+                        if (matchSubscriptionIndexedSkippingAccessPredicate(
+                                indexed, subPtr->sub, skipIdx)) {
                             matchingSubs.push_back(id);
                         }
                     }
@@ -707,6 +755,11 @@ private:
     // approach. Attaching the state directly to the leaf means PSTree's own
     // copyLeafNode()/cloneUserData_ propagates it automatically on every split, the same
     // way predCounter already does.
+    // Forward-declared: only a pointer is needed inside LeafGroupState below, defined in full
+    // further down (see its own comment) - it's the value type of subscriptions_, paired with
+    // the access-predicate index InsertSubscription chose for it.
+    struct StoredSubscription;
+
     struct LeafGroupState {
         std::size_t dimSigLen = detail::kInitialDimSigLen;
         std::size_t subNum = 0;
@@ -720,7 +773,13 @@ private:
         // references/pointers to an element except by erasing that exact element - see
         // InsertSubscription's and DeleteSubscription's own comments for why the ordering
         // guarantees a pointer is never read here after its target is erased.
-        std::unordered_map<DimSig, std::vector<std::pair<std::uint64_t, const Subscription*>>, DimSig::Hasher> groups;
+        //
+        // Points at the whole StoredSubscription (not just its `.sub` field) so MatchEvent's own
+        // hot loop can read `accIdx` back too, alongside the subscription itself - see
+        // matchSubscriptionIndexedSkippingAccessPredicate's own comment (predicate.hpp) for why
+        // that's needed: matchPoint()'s own tree walk already exactly proves the access
+        // predicate, so re-checking it again per candidate is pure wasted work at scale.
+        std::unordered_map<DimSig, std::vector<std::pair<std::uint64_t, const StoredSubscription*>>, DimSig::Hasher> groups;
     };
 
     static void destroyLeafGroupState(void* p) { delete static_cast<LeafGroupState*>(p); }
@@ -753,6 +812,10 @@ private:
     struct StoredSubscription {
         Subscription sub;
         std::size_t accIdx;
+        // Computed once at insert time (detail::accessPredicateProvenExactlyByTreeMembership on
+        // the CHOSEN access predicate's own op) and cached here, same convention as accIdx itself
+        // - see that function's own comment for exactly which operators this covers and why.
+        bool accIdxSkippable;
     };
 
     // Returns this leaf's LeafGroupState, allocating one on first touch.
@@ -856,13 +919,13 @@ private:
     // (ReorganizeGroups is referenced by name only) - this is the natural, only-sensible
     // implementation of what it must do given the rest of Algorithm 4/6's own description.
     void reorganizeGroups(LeafGroupState& state) {
-        std::vector<std::pair<std::uint64_t, const Subscription*>> allSubs;
+        std::vector<std::pair<std::uint64_t, const StoredSubscription*>> allSubs;
         for (auto& [sig, ids] : state.groups) {
             allSubs.insert(allSubs.end(), ids.begin(), ids.end());
         }
         state.groups.clear();
         for (auto& [id, subPtr] : allSubs) {
-            DimSig sig = calculateDimSig(detail::dimSigDimensions(*subPtr), state.dimSigLen);
+            DimSig sig = calculateDimSig(detail::dimSigDimensions(subPtr->sub), state.dimSigLen);
             state.groups[sig].emplace_back(id, subPtr);
         }
     }

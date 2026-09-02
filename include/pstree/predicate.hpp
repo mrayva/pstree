@@ -765,4 +765,48 @@ inline bool matchSubscriptionIndexed(std::span<const Value* const> indexed, cons
     return true;
 }
 
+// Same as matchSubscriptionIndexed above, except it skips re-checking the predicate at
+// `accPredIndex` entirely. Deliberately a separate function, not a parameter added to
+// matchSubscriptionIndexed itself: that function stays the general "check every predicate"
+// reference used by tests/test_pst_dynamic.cpp's own name-based-vs-index-based correctness
+// cross-check, which must keep meaning exactly that.
+//
+// Why skipping `accPredIndex` is safe, not a heuristic - PROVIDED the caller only ever passes the
+// real access-predicate index for operators where this actually holds (see
+// PSTDynamic::detail::accessPredicateProvenExactlyByTreeMembership's own comment for exactly
+// which ones, and PSTDynamic::StoredSubscription::accIdxSkippable for where that's decided once,
+// at insert time, and cached): this is only ever called on a subscription reached via
+// PSTDynamic::matchEvent()'s own PSTree::matchPoint() lookup - an EXACT digit-walk of the
+// canonical ancestor markers (or the equality hashmap) for the subscription's chosen access
+// predicate. For an operator that gets a real, value-specific tree placement there (kEq/kLt/kLe/
+// kGt/kGe/kBetween/kElemOf), matchPoint() returning this bucket at all is an exact proof the
+// event's value satisfies that predicate - re-running matchValue()/scalarCompare() on it here
+// would be pure repeated work. It is NOT safe for kNe/kNotElemOf/kIsNotNull, which instead get a
+// "matches every leaf" catch-all placement (buildLowLevel's own comment) - reaching the bucket
+// proves nothing about those, so the caller must pass a sentinel (an out-of-range index, e.g.
+// `sub.predicates.size()`) instead of `accIdx` for those, falling back to a full check of every
+// predicate. The only approximate step anywhere in this pipeline is DimSig's own Bloom-filter
+// dimension-PRESENCE check (groupSig.isSubsetOf(eventSig)) - which never re-examines a
+// predicate's actual value, only whether the event has the right attributes at all - so it
+// doesn't change this argument either way.
+inline bool matchSubscriptionIndexedSkippingAccessPredicate(
+        std::span<const Value* const> indexed, const Subscription& sub, std::size_t accPredIndex) {
+    for (std::size_t i = 0; i < sub.predicates.size(); ++i) {
+        if (i == accPredIndex) continue;
+        const auto& pred = sub.predicates[i];
+        const Value* val = (pred.attrIndex < indexed.size()) ? indexed[pred.attrIndex] : nullptr;
+        if (pred.op == CmpOp::kIsNull) {
+            if (val != nullptr) return false;
+            continue;
+        }
+        if (pred.op == CmpOp::kIsNotNull) {
+            if (val == nullptr) return false;
+            continue;
+        }
+        if (val == nullptr) return false;
+        if (!matchValue(*val, pred)) return false;
+    }
+    return true;
+}
+
 } // namespace pstree
