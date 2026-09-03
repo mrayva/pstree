@@ -649,7 +649,16 @@ public:
         eventDims.reserve(internedEvent.size());
         for (auto& pair : internedEvent) eventDims.push_back(pair.attr);
 
-        std::vector<std::uint64_t> matchingSubs;
+        // First pass: walk each dimension's tree exactly once (matchPoint() is a real tree
+        // traversal, not free - doing this twice to get a size hint up front would cost far more
+        // than the push_back()s it's meant to save), collecting a pointer to every candidate
+        // group whose groupSig survives the isSubsetOf check, plus a running upper bound on the
+        // total number of candidate ids across all of them (ids.size() is O(1) - already known,
+        // no extra work to read it here). candidateGroups' own growth is unreserved but cheap:
+        // one entry per matching *group*, not per candidate id, so it stays small even when the
+        // id-level fan-out below is large.
+        std::vector<const std::vector<GroupEntry>*> candidateGroups;
+        std::size_t idUpperBound = 0;
         for (auto& pair : internedEvent) {
             auto dimIt = dimensions_.find(pair.attr);
             if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
@@ -666,30 +675,44 @@ public:
                 DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
                 for (auto& [groupSig, ids] : state.groups) {
                     if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
-                    for (auto& entry : ids) {
-                        // Fast path: a single-predicate subscription whose sole predicate IS the
-                        // (skippable) access predicate is fully proven by matchPoint()'s own tree
-                        // walk alone - reached with ZERO dereference into subPtr/subscriptions_ at
-                        // all (see GroupEntry's own comment for why that dereference was, until
-                        // this change, the single hottest instruction in this whole function).
-                        if (entry.accIdxSkippable && entry.onlyPredicateIsAccess) {
-                            matchingSubs.push_back(entry.id);
-                            continue;
-                        }
-                        // Otherwise fall back to the full per-predicate check, skipping only the
-                        // access predicate's own re-check when it's one of the operators
-                        // buildLowLevel gives a real, value-specific tree placement to
-                        // (accIdxSkippable). kNe/kNotElemOf/kIsNotNull instead get a "matches
-                        // every leaf" catch-all there, so reaching this leaf proves nothing about
-                        // them - the sentinel index (sub.predicates.size(), never a valid
-                        // predicate index) means "skip nothing," falling back to the full check.
-                        std::size_t skipIdx = entry.accIdxSkippable
-                            ? entry.accIdx : entry.subPtr->sub.predicates.size();
-                        if (matchSubscriptionIndexedSkippingAccessPredicate(
-                                indexed, entry.subPtr->sub, skipIdx)) {
-                            matchingSubs.push_back(entry.id);
-                        }
-                    }
+                    candidateGroups.push_back(&ids);
+                    idUpperBound += ids.size();
+                }
+            }
+        }
+
+        // Second pass: the actual per-candidate check, now over the already-collected groups -
+        // matchingSubs is reserve()'d to its worst case (every candidate passes) so it never
+        // reallocates mid-scan. Found via `perf annotate` (2026-09, real K=8000/high-fan-out
+        // benchmark): push_back()'s own inline capacity-check-and-grow was ~82% of this whole
+        // function's self-time - not the expression evaluation below - at that end of the
+        // selectivity range. idUpperBound can only overshoot the real match count (some
+        // candidates fail their predicate check), never undershoot it, so this is always enough.
+        std::vector<std::uint64_t> matchingSubs;
+        matchingSubs.reserve(idUpperBound);
+        for (const auto* ids : candidateGroups) {
+            for (auto& entry : *ids) {
+                // Fast path: a single-predicate subscription whose sole predicate IS the
+                // (skippable) access predicate is fully proven by matchPoint()'s own tree
+                // walk alone - reached with ZERO dereference into subPtr/subscriptions_ at
+                // all (see GroupEntry's own comment for why that dereference was, until
+                // this change, the single hottest instruction in this whole function).
+                if (entry.accIdxSkippable && entry.onlyPredicateIsAccess) {
+                    matchingSubs.push_back(entry.id);
+                    continue;
+                }
+                // Otherwise fall back to the full per-predicate check, skipping only the
+                // access predicate's own re-check when it's one of the operators
+                // buildLowLevel gives a real, value-specific tree placement to
+                // (accIdxSkippable). kNe/kNotElemOf/kIsNotNull instead get a "matches
+                // every leaf" catch-all there, so reaching this leaf proves nothing about
+                // them - the sentinel index (sub.predicates.size(), never a valid
+                // predicate index) means "skip nothing," falling back to the full check.
+                std::size_t skipIdx = entry.accIdxSkippable
+                    ? entry.accIdx : entry.subPtr->sub.predicates.size();
+                if (matchSubscriptionIndexedSkippingAccessPredicate(
+                        indexed, entry.subPtr->sub, skipIdx)) {
+                    matchingSubs.push_back(entry.id);
                 }
             }
         }
