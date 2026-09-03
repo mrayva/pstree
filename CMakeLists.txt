@@ -45,6 +45,7 @@ set(PSTREE_UNIT_TESTS
     test_dim_sig
     test_pst_dynamic
     test_pst_dynamic_stress
+    test_pst_dynamic_count
 )
 
 foreach(test_name IN LISTS PSTREE_UNIT_TESTS)

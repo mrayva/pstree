@@ -607,116 +607,54 @@ public:
     // every leaf first, then process them) into one pass - each event attribute maps to a
     // DIFFERENT dimension's own PS-Tree, so there's no shared state between iterations the
     // separate phases could have been protecting; the result is identical either way.
+    //
+    // Implemented on top of scanCandidates()/walkCandidates() (see their own comments, just
+    // above GroupEntry's definition) - a real perf finding (`perf annotate`, 2026-09, real
+    // K=8000/high-fan-out benchmark) showed push_back()'s own inline capacity-check-and-grow was
+    // ~82% of this whole function's self-time, not the expression evaluation itself - meaning a
+    // caller that only needs a COUNT of matches (not which ones), such as
+    // matchEventCount() below, can skip that cost entirely by supplying a different `visit`
+    // to the SAME walk rather than paying for a vector it doesn't need. matchEvent() itself is
+    // unchanged in behavior - still reserve()'s its result to scanCandidates()'s own
+    // idUpperBound (an upper bound only - some candidates fail their predicate check, never
+    // undershoots) so it never reallocates mid-scan.
     std::vector<std::uint64_t> matchEvent(const Event& event) const {
-        // Interned copy of the whole event, built ONCE here - every string-typed attribute's
-        // value gets replaced by its interned int64_t id (via lookupForSearch: read-only, a
-        // value no subscription ever referenced maps to StringInternTable::kSentinel rather
-        // than allocating - see that class's own comment). Used for BOTH the per-dimension
-        // PS-Tree lookup below AND matchSubscription()'s own full-verification re-lookup of
-        // this same event's values (via findAttr, once per predicate) - interning here, once
-        // per event attribute, instead of leaving matchSubscription to repeatedly compare a raw
-        // std::string against however many candidate subscriptions' own predicates reference it,
-        // is what actually makes the full-verification path fast too, not just the one
-        // predicate PS-Tree itself indexes - see insertSubscription's own comment for the other
-        // half of this (why the STORED subscription needs its OTHER predicates interned too,
-        // not just its access predicate).
-        //
-        // `indexed` is built in the SAME pass, for the same "pay once per event attribute,
-        // amortize across every candidate subscription" reason: indexed[i] is the Value for
-        // whichever event attribute has ordinal `i` (DimensionIndex::index), or nullptr if
-        // this event doesn't have that attribute at all - see matchSubscriptionIndexed's own
-        // comment in predicate.hpp for why this replaces findAttr()'s per-(predicate,
-        // candidate) name scan with an O(1) array read. Local to this call, never shared
-        // across matchEvent() invocations or threads - see StringInternTable's own comment for
-        // why a shared mutable scratch buffer here would reintroduce the exact class of race
-        // just fixed (found via `perf`, 2026-08-30: real, comparable in size to std::variant's
-        // own dispatch overhead at real subscription counts).
-        // dimensions_.size() <= kMaxSchemaAttrs is a permanent, whole-lifetime invariant,
-        // enforced once in the constructor - no runtime check needed on this per-event path.
-        Event internedEvent = event;
+        Event internedEvent;
         std::array<const Value*, kMaxSchemaAttrs> indexedStorage{};
-        std::span<const Value*> indexed(indexedStorage.data(), dimensions_.size());
-        for (auto& pair : internedEvent) {
-            auto dimIt = dimensions_.find(pair.attr);
-            if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
-            if (dimIt->second.schema.type == ValueType::kString) {
-                pair.val = Value(dimIt->second.schema.stringIntern->lookupForSearch(std::get<std::string>(pair.val)));
-            }
-            indexed[dimIt->second.index] = &pair.val;
-        }
+        std::span<const Value*> indexed;
+        CandidateScan scan = scanCandidates(event, internedEvent, indexedStorage, indexed);
 
-        std::vector<std::string> eventDims;
-        eventDims.reserve(internedEvent.size());
-        for (auto& pair : internedEvent) eventDims.push_back(pair.attr);
-
-        // First pass: walk each dimension's tree exactly once (matchPoint() is a real tree
-        // traversal, not free - doing this twice to get a size hint up front would cost far more
-        // than the push_back()s it's meant to save), collecting a pointer to every candidate
-        // group whose groupSig survives the isSubsetOf check, plus a running upper bound on the
-        // total number of candidate ids across all of them (ids.size() is O(1) - already known,
-        // no extra work to read it here). candidateGroups' own growth is unreserved but cheap:
-        // one entry per matching *group*, not per candidate id, so it stays small even when the
-        // id-level fan-out below is large.
-        std::vector<const std::vector<GroupEntry>*> candidateGroups;
-        std::size_t idUpperBound = 0;
-        for (auto& pair : internedEvent) {
-            auto dimIt = dimensions_.find(pair.attr);
-            if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
-            const DimensionIndex& dim = dimIt->second;
-
-            ElementKey key = detail::encodeValue(pair.val, dim.schema);
-            // A point can now be covered by several buckets at once (an equality bucket plus
-            // any number of ancestor range markers along its path - see ps_tree.hpp's
-            // canonical-decomposition redesign), not just one leaf.
-            for (LeafNode* leaf : dim.tree.matchPoint(key)) {
-                if (leaf->userData == nullptr) continue; // no subscription ever attached to this bucket
-
-                const LeafGroupState& state = *static_cast<LeafGroupState*>(leaf->userData);
-                DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
-                for (auto& [groupSig, ids] : state.groups) {
-                    if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
-                    candidateGroups.push_back(&ids);
-                    idUpperBound += ids.size();
-                }
-            }
-        }
-
-        // Second pass: the actual per-candidate check, now over the already-collected groups -
-        // matchingSubs is reserve()'d to its worst case (every candidate passes) so it never
-        // reallocates mid-scan. Found via `perf annotate` (2026-09, real K=8000/high-fan-out
-        // benchmark): push_back()'s own inline capacity-check-and-grow was ~82% of this whole
-        // function's self-time - not the expression evaluation below - at that end of the
-        // selectivity range. idUpperBound can only overshoot the real match count (some
-        // candidates fail their predicate check), never undershoot it, so this is always enough.
         std::vector<std::uint64_t> matchingSubs;
-        matchingSubs.reserve(idUpperBound);
-        for (const auto* ids : candidateGroups) {
-            for (auto& entry : *ids) {
-                // Fast path: a single-predicate subscription whose sole predicate IS the
-                // (skippable) access predicate is fully proven by matchPoint()'s own tree
-                // walk alone - reached with ZERO dereference into subPtr/subscriptions_ at
-                // all (see GroupEntry's own comment for why that dereference was, until
-                // this change, the single hottest instruction in this whole function).
-                if (entry.accIdxSkippable && entry.onlyPredicateIsAccess) {
-                    matchingSubs.push_back(entry.id);
-                    continue;
-                }
-                // Otherwise fall back to the full per-predicate check, skipping only the
-                // access predicate's own re-check when it's one of the operators
-                // buildLowLevel gives a real, value-specific tree placement to
-                // (accIdxSkippable). kNe/kNotElemOf/kIsNotNull instead get a "matches
-                // every leaf" catch-all there, so reaching this leaf proves nothing about
-                // them - the sentinel index (sub.predicates.size(), never a valid
-                // predicate index) means "skip nothing," falling back to the full check.
-                std::size_t skipIdx = entry.accIdxSkippable
-                    ? entry.accIdx : entry.subPtr->sub.predicates.size();
-                if (matchSubscriptionIndexedSkippingAccessPredicate(
-                        indexed, entry.subPtr->sub, skipIdx)) {
-                    matchingSubs.push_back(entry.id);
-                }
-            }
-        }
+        matchingSubs.reserve(scan.idUpperBound);
+        walkCandidates(scan, indexed, [&matchingSubs](std::uint64_t id) {
+            matchingSubs.push_back(id);
+        });
         return matchingSubs;
+    }
+
+    // Same matching walk as matchEvent(), but invokes visit(id) once per match instead of
+    // collecting into a vector - no std::vector<std::uint64_t> is ever built here, on either the
+    // fast (access-predicate-only) or full-check path. Exists specifically for a caller (see
+    // nats_sidecar's pstree_matching_engine::search_count()) that needs to translate/dedup
+    // matched ids incrementally without ever materializing the raw match list matchEvent()
+    // would otherwise have to build only to immediately discard - see matchEventCount() below
+    // for the simplest such caller.
+    template <typename Visit>
+    void matchEventEach(const Event& event, Visit&& visit) const {
+        Event internedEvent;
+        std::array<const Value*, kMaxSchemaAttrs> indexedStorage{};
+        std::span<const Value*> indexed;
+        CandidateScan scan = scanCandidates(event, internedEvent, indexedStorage, indexed);
+        walkCandidates(scan, indexed, std::forward<Visit>(visit));
+    }
+
+    // Convenience built on matchEventEach(): the number of matches for `event`, always exactly
+    // matchEvent(event).size() (see this project's own differential test), without ever building
+    // the vector matchEvent() would need to compute that same number.
+    std::size_t matchEventCount(const Event& event) const {
+        std::size_t count = 0;
+        matchEventEach(event, [&count](std::uint64_t) { ++count; });
+        return count;
     }
 
     // Algorithm 6, DeleteSubscription.
@@ -877,6 +815,144 @@ private:
         bool accIdxSkippable;
         bool onlyPredicateIsAccess; // sub.predicates.size() == 1
     };
+
+    // matchEvent()'s own pass 1 output (see that function's original comment, preserved below on
+    // scanCandidates()) - factored out so matchEvent(), matchEventEach(), and matchEventCount()
+    // can all share exactly one implementation of both passes via walkCandidates(), rather than
+    // three near-identical copies that could silently drift apart over time. Stores POINTERS
+    // into the live tree's own group storage (matching what candidateGroups already held inline
+    // in matchEvent() before this refactor) - valid only for the lifetime of the matchEvent*
+    // call that produced it, same as before.
+    struct CandidateScan {
+        std::vector<const std::vector<GroupEntry>*> candidateGroups;
+        std::size_t idUpperBound = 0;
+    };
+
+    // Interns `event` and walks each dimension's tree exactly once, collecting a pointer to
+    // every candidate group whose groupSig survives the isSubsetOf check plus a running upper
+    // bound on the total candidate id count - identical to matchEvent()'s own former first pass,
+    // moved here verbatim. `internedEvent`/`indexedStorage`/`indexed` are all caller-owned
+    // out-params, not returned by value or built as locals here: `indexed` holds pointers
+    // (`&pair.val`) directly into `internedEvent`'s own Value objects, and both `indexed` itself
+    // and `indexedStorage` (the array `indexed` is a span over) must all stay alive through
+    // walkCandidates() below, which is called from a DIFFERENT function than this one
+    // (matchEvent()/matchEventEach()) - if `internedEvent` were a local here instead, `indexed`
+    // would be left dangling into a destroyed stack frame the moment this function returns, a
+    // real bug this exact refactor introduced once already (caught by this project's own
+    // existing test suite immediately, before being committed - see git history). Keeping all
+    // three as the CALLER's own locals, passed in by reference, is what keeps their lifetimes
+    // tied to the caller's own stack frame instead of this one.
+    CandidateScan scanCandidates(const Event& event, Event& internedEvent,
+                                  std::array<const Value*, kMaxSchemaAttrs>& indexedStorage,
+                                  std::span<const Value*>& indexed) const {
+        // Interned copy of the whole event, built ONCE here - every string-typed attribute's
+        // value gets replaced by its interned int64_t id (via lookupForSearch: read-only, a
+        // value no subscription ever referenced maps to StringInternTable::kSentinel rather
+        // than allocating - see that class's own comment). Used for BOTH the per-dimension
+        // PS-Tree lookup below AND matchSubscription()'s own full-verification re-lookup of
+        // this same event's values (via findAttr, once per predicate) - interning here, once
+        // per event attribute, instead of leaving matchSubscription to repeatedly compare a raw
+        // std::string against however many candidate subscriptions' own predicates reference it,
+        // is what actually makes the full-verification path fast too, not just the one
+        // predicate PS-Tree itself indexes - see insertSubscription's own comment for the other
+        // half of this (why the STORED subscription needs its OTHER predicates interned too,
+        // not just its access predicate).
+        //
+        // `indexed` is built in the SAME pass, for the same "pay once per event attribute,
+        // amortize across every candidate subscription" reason: indexed[i] is the Value for
+        // whichever event attribute has ordinal `i` (DimensionIndex::index), or nullptr if
+        // this event doesn't have that attribute at all - see matchSubscriptionIndexed's own
+        // comment in predicate.hpp for why this replaces findAttr()'s per-(predicate,
+        // candidate) name scan with an O(1) array read. Local to this call, never shared
+        // across matchEvent() invocations or threads - see StringInternTable's own comment for
+        // why a shared mutable scratch buffer here would reintroduce the exact class of race
+        // just fixed (found via `perf`, 2026-08-30: real, comparable in size to std::variant's
+        // own dispatch overhead at real subscription counts).
+        // dimensions_.size() <= kMaxSchemaAttrs is a permanent, whole-lifetime invariant,
+        // enforced once in the constructor - no runtime check needed on this per-event path.
+        internedEvent = event;
+        indexed = std::span<const Value*>(indexedStorage.data(), dimensions_.size());
+        for (auto& pair : internedEvent) {
+            auto dimIt = dimensions_.find(pair.attr);
+            if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
+            if (dimIt->second.schema.type == ValueType::kString) {
+                pair.val = Value(dimIt->second.schema.stringIntern->lookupForSearch(std::get<std::string>(pair.val)));
+            }
+            indexed[dimIt->second.index] = &pair.val;
+        }
+
+        std::vector<std::string> eventDims;
+        eventDims.reserve(internedEvent.size());
+        for (auto& pair : internedEvent) eventDims.push_back(pair.attr);
+
+        // Walk each dimension's tree exactly once (matchPoint() is a real tree traversal, not
+        // free - doing this twice to get a size hint up front would cost far more than the
+        // push_back()s it's meant to save), collecting a pointer to every candidate group whose
+        // groupSig survives the isSubsetOf check, plus a running upper bound on the total number
+        // of candidate ids across all of them (ids.size() is O(1) - already known, no extra work
+        // to read it here). candidateGroups' own growth is unreserved but cheap: one entry per
+        // matching *group*, not per candidate id, so it stays small even when the id-level
+        // fan-out below is large.
+        CandidateScan scan;
+        for (auto& pair : internedEvent) {
+            auto dimIt = dimensions_.find(pair.attr);
+            if (dimIt == dimensions_.end()) continue; // event attribute outside the schema - ignore, not an error
+            const DimensionIndex& dim = dimIt->second;
+
+            ElementKey key = detail::encodeValue(pair.val, dim.schema);
+            // A point can now be covered by several buckets at once (an equality bucket plus
+            // any number of ancestor range markers along its path - see ps_tree.hpp's
+            // canonical-decomposition redesign), not just one leaf.
+            for (LeafNode* leaf : dim.tree.matchPoint(key)) {
+                if (leaf->userData == nullptr) continue; // no subscription ever attached to this bucket
+
+                const LeafGroupState& state = *static_cast<LeafGroupState*>(leaf->userData);
+                DimSig eventSig = calculateDimSig(eventDims, state.dimSigLen);
+                for (auto& [groupSig, ids] : state.groups) {
+                    if (!groupSig.isSubsetOf(eventSig)) continue; // group needs a dimension this event doesn't have
+                    scan.candidateGroups.push_back(&ids);
+                    scan.idUpperBound += ids.size();
+                }
+            }
+        }
+        return scan;
+    }
+
+    // matchEvent()'s own former second pass, generalized: invokes visit(id) once per confirmed
+    // match instead of always push_back-ing into a result vector. matchEvent(), matchEventEach(),
+    // and matchEventCount() all funnel through this ONE loop so the fast-path/full-check branch
+    // logic (and any future fix to it) can never drift between them - see GroupEntry's and
+    // matchSubscriptionIndexedSkippingAccessPredicate's own comments for what each branch means.
+    template <typename Visit>
+    void walkCandidates(const CandidateScan& scan, std::span<const Value*> indexed,
+                         Visit&& visit) const {
+        for (const auto* ids : scan.candidateGroups) {
+            for (auto& entry : *ids) {
+                // Fast path: a single-predicate subscription whose sole predicate IS the
+                // (skippable) access predicate is fully proven by matchPoint()'s own tree
+                // walk alone - reached with ZERO dereference into subPtr/subscriptions_ at
+                // all (see GroupEntry's own comment for why that dereference was, until
+                // this change, the single hottest instruction in this whole function).
+                if (entry.accIdxSkippable && entry.onlyPredicateIsAccess) {
+                    visit(entry.id);
+                    continue;
+                }
+                // Otherwise fall back to the full per-predicate check, skipping only the
+                // access predicate's own re-check when it's one of the operators
+                // buildLowLevel gives a real, value-specific tree placement to
+                // (accIdxSkippable). kNe/kNotElemOf/kIsNotNull instead get a "matches
+                // every leaf" catch-all there, so reaching this leaf proves nothing about
+                // them - the sentinel index (sub.predicates.size(), never a valid
+                // predicate index) means "skip nothing," falling back to the full check.
+                std::size_t skipIdx = entry.accIdxSkippable
+                    ? entry.accIdx : entry.subPtr->sub.predicates.size();
+                if (matchSubscriptionIndexedSkippingAccessPredicate(
+                        indexed, entry.subPtr->sub, skipIdx)) {
+                    visit(entry.id);
+                }
+            }
+        }
+    }
 
     // Returns this leaf's LeafGroupState, allocating one on first touch.
     static LeafGroupState& groupStateFor(LeafNode* leaf) {
