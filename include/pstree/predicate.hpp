@@ -43,10 +43,12 @@ namespace pstree {
 // references it, full stop). They exist here because a real caller (nats_sidecar) needs to
 // test presence/absence itself as a first-class predicate ("discount is null"), which
 // `vals`-based value comparison can't express - see matchSubscription()'s own special-casing
-// for them below, and pst_dynamic.hpp's SelectAccPred/applyToTree comments for why kIsNull
-// specifically can never be used as an access predicate (no tree can index "this dimension
-// was absent", since MatchEvent only ever consults a dimension's tree for events that DO
-// have it).
+// for them below, and pst_dynamic.hpp's selectAccPredIndex/buildLowLevel comments for why
+// kIsNull specifically can never be used as an access predicate (no tree can index "this
+// dimension was absent", since MatchEvent only ever consults a dimension's tree for events
+// that DO have it) - a subscription whose every predicate is kIsNull is still fully supported,
+// just via a separate side-list mechanism instead of tree indexing (see
+// PSTDynamic::nullOnlySubsByTriggerAttr_).
 enum class CmpOp {
     kLt,
     kLe,

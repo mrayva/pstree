@@ -215,15 +215,19 @@ by the redesign; briefly, on the now-superseded original design:
   real follow-up work for the `nats_sidecar` integration phase, not assumed solved.
 - **`kIsNull`/`kIsNotNull` are not part of the paper's model at all** - added for a real caller's
   need (nats_sidecar's own "attribute is/is not present" predicates), evaluated on ABSENCE rather
-  than a value comparison. `kIsNull` can never be an access predicate (rejected clearly at insert
-  time if it's the only/best option) - there is structurally no way to index "this dimension was
-  absent", since `MatchEvent` only ever consults a dimension's tree for events that DO have it.
-  `kIsNotNull` CAN be indexed (falls back to "matches every leaf", which is exactly correct here,
-  not just safe - see the code comment). A real, subtle bug found by extending the tests for this:
-  a subscription's dimension signature must EXCLUDE any dimension used only via `kIsNull` - the
-  signature's whole pruning contract assumes "this subscription needs dimension D" means "D must
-  be present", which is backwards for `kIsNull` and would incorrectly prune out the exact events
-  it's meant to match.
+  than a value comparison. `kIsNull` can never be a POSITIVE access predicate PLACED IN a
+  dimension's tree - there is structurally no way to index "this dimension was absent", since
+  `MatchEvent` only ever consults a dimension's tree for events that DO have it. A subscription
+  whose every predicate is `kIsNull` (e.g. a bare `"discount is null"`) is still fully supported,
+  though: `InsertSubscription` detects that shape and routes it to a small side-list instead,
+  keyed by one of the subscription's own attributes and checked directly against whichever event
+  attributes are absent - see `PSTDynamic::nullOnlySubsByTriggerAttr_` and
+  `walkNullOnlySubscriptions` in `pst_dynamic.hpp`. `kIsNotNull` CAN be indexed normally (falls
+  back to "matches every leaf", which is exactly correct here, not just safe - see the code
+  comment). A real, subtle bug found by extending the tests for this: a subscription's dimension
+  signature must EXCLUDE any dimension used only via `kIsNull` - the signature's whole pruning
+  contract assumes "this subscription needs dimension D" means "D must be present", which is
+  backwards for `kIsNull` and would incorrectly prune out the exact events it's meant to match.
 
 ## Building
 

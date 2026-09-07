@@ -221,7 +221,11 @@ void test_matchEventCount_random_stress() {
             try {
                 pstd.insertSubscription(sub);
             } catch (const std::invalid_argument&) {
-                continue; // an all-kIsNull subscription is legitimately rejected - see pst_dynamic.hpp
+                // No longer expected to actually fire for an all-kIsNull subscription (those
+                // are now indexed via the null-only side-list, not rejected - see
+                // pst_dynamic.hpp's insertSubscription) - kept as a defensive catch in case a
+                // future randomPredicate() change introduces some other genuinely-invalid shape.
+                continue;
             }
             activeIds.push_back(sub.id);
         } else {

@@ -253,7 +253,11 @@ inline int opRank(CmpOp op) {
         case CmpOp::kNotElemOf: return 4;
         case CmpOp::kNe:
         case CmpOp::kIsNotNull: return 5; // same "matches everything" fallback tier as kNe
-        case CmpOp::kIsNull: return 6;    // worse than kNe: cannot be indexed AT ALL (see applyToTree)
+        case CmpOp::kIsNull: return 6;    // worse than kNe: has no PS-Tree range at all (see
+                                          // buildLowLevel's own kIsNull case) - never wins this
+                                          // ranking unless it's the only predicate present, in
+                                          // which case insertSubscription routes around this
+                                          // ranking entirely (see its own comment)
     }
     return 6;
 }
@@ -436,11 +440,19 @@ public:
             if (better) best = i;
         }
         // kIsNull ranks worst specifically so it's only ever chosen when nothing else is
-        // available (see opRank) - and when that happens, the subscription genuinely can't be
-        // indexed at all: "X is null" only matches events where X is absent, but MatchEvent
-        // never consults X's own dimension tree for such events in the first place (there's no
-        // pair to route through). Caught here, at selection time, with a clear message - not
-        // silently left to produce a subscription that can never match anything.
+        // available (see opRank) - meaning every predicate in `sub` is kIsNull (any other op
+        // always outranks it). This function itself still throws in that case: it promises to
+        // return an ACCESS predicate index, and "X is null" has no representable PS-Tree range
+        // to be one ("X is null" only matches events where X is absent, but MatchEvent never
+        // consults X's own dimension tree for such events in the first place - there's no pair
+        // to route through). insertSubscription no longer calls this function for that case at
+        // all, though - it detects the identical all-kIsNull condition itself, BEFORE this
+        // call, and routes those subscriptions to nullOnlySubsByTriggerAttr_'s side-list
+        // instead, so a real caller's bare "X is null" subscription is now indexed successfully,
+        // not rejected (see insertSubscription's own comment). This throw only still fires for
+        // a caller invoking selectAccPredIndex directly (e.g. a test, or diagnostics/tuning code
+        // - see this function's own top comment) on a subscription that would hit the same
+        // condition.
         if (sub.predicates[best].op == CmpOp::kIsNull) {
             throw std::invalid_argument(
                 "pstree: subscription " + std::to_string(sub.id) +
@@ -551,6 +563,32 @@ public:
             ensurePredicateCachedForInsert(pred);
         }
 
+        // A subscription whose EVERY predicate is kIsNull has no predicate any dimension's
+        // PS-Tree can hold (see selectAccPredIndex's own comment for why - "matches on
+        // absence" has no representable contiguous range, and this is the ONLY shape where
+        // that predicate could even be selected as "best": any non-kIsNull predicate always
+        // outranks kIsNull in opRank, so kIsNull only wins the selection when it's literally
+        // the only kind of predicate present). Rather than reject these outright (the old
+        // behavior - see git history / [[project_pstree_isnull_indexing_gap]]), route them to
+        // a small side-list instead, keyed by one of their own kIsNull attributes (any single
+        // one suffices - see walkNullOnlySubscriptions's own comment for why). `!empty()` guards
+        // std::all_of's vacuous-true on an empty predicate list, which must still fall through
+        // to selectAccPredIndex's own "no predicates" rejection below, not be silently accepted
+        // as a null-only subscription with nothing to trigger on.
+        bool allIsNull = !interned.predicates.empty() &&
+            std::all_of(interned.predicates.begin(), interned.predicates.end(),
+                        [](const SubPredicate& p) { return p.op == CmpOp::kIsNull; });
+        if (allIsNull) {
+            auto [subIt, subInserted] = subscriptions_.emplace(
+                sub.id, StoredSubscription{std::move(interned), /*accIdx=*/0,
+                                            /*accIdxSkippable=*/false, /*isNullOnly=*/true});
+            const StoredSubscription* subPtr = &subIt->second;
+            const std::string& triggerAttr = subPtr->sub.predicates[0].attr;
+            nullOnlySubsByTriggerAttr_[triggerAttr].push_back(subPtr);
+            ++nullOnlySubCount_;
+            return;
+        }
+
         std::size_t accIdx = selectAccPredIndex(interned);
         const SubPredicate& chosenAccPred = interned.predicates.at(accIdx);
         const std::string& accAttr = chosenAccPred.attr;
@@ -625,8 +663,11 @@ public:
         CandidateScan scan = scanCandidates(event, internedEvent, indexedStorage, indexed);
 
         std::vector<std::uint64_t> matchingSubs;
-        matchingSubs.reserve(scan.idUpperBound);
+        matchingSubs.reserve(scan.idUpperBound + nullOnlySubCount_);
         walkCandidates(scan, indexed, [&matchingSubs](std::uint64_t id) {
+            matchingSubs.push_back(id);
+        });
+        walkNullOnlySubscriptions(event, [&matchingSubs](std::uint64_t id) {
             matchingSubs.push_back(id);
         });
         return matchingSubs;
@@ -645,7 +686,8 @@ public:
         std::array<const Value*, kMaxSchemaAttrs> indexedStorage{};
         std::span<const Value*> indexed;
         CandidateScan scan = scanCandidates(event, internedEvent, indexedStorage, indexed);
-        walkCandidates(scan, indexed, std::forward<Visit>(visit));
+        walkCandidates(scan, indexed, visit);
+        walkNullOnlySubscriptions(event, visit);
     }
 
     // Convenience built on matchEventEach(): the number of matches for `event`, always exactly
@@ -663,6 +705,33 @@ public:
         if (subIt == subscriptions_.end()) {
             throw std::invalid_argument("pstree: deleting unknown subscription id " + std::to_string(subId));
         }
+
+        // Null-only subscriptions (see insertSubscription's own comment) never touched any
+        // dimension's PS-Tree or dimSig grouping - just the side-list keyed by their trigger
+        // attribute. Removed here directly, skipping every step below that assumes this
+        // subscription actually has an access predicate placed in a tree.
+        if (subIt->second.isNullOnly) {
+            const std::string triggerAttr = subIt->second.sub.predicates[0].attr;
+            auto bucketIt = nullOnlySubsByTriggerAttr_.find(triggerAttr);
+            if (bucketIt == nullOnlySubsByTriggerAttr_.end()) {
+                throw std::logic_error(
+                    "pstree: null-only subscription's trigger bucket missing on delete - "
+                    "insert/delete bookkeeping bug");
+            }
+            const StoredSubscription* target = &subIt->second;
+            auto& bucket = bucketIt->second;
+            auto entryIt = std::find(bucket.begin(), bucket.end(), target);
+            if (entryIt == bucket.end()) {
+                throw std::logic_error(
+                    "pstree: null-only subscription missing from its own trigger bucket on delete");
+            }
+            bucket.erase(entryIt);
+            if (bucket.empty()) nullOnlySubsByTriggerAttr_.erase(bucketIt);
+            --nullOnlySubCount_;
+            subscriptions_.erase(subIt);
+            return;
+        }
+
         const Subscription sub = subIt->second.sub; // copy - erased from subscriptions_ before returning
         // Read back the index InsertSubscription chose and stored, rather than recomputing via
         // selectAccPredIndex() - see that function's own comment for why recomputing here could
@@ -793,6 +862,12 @@ private:
         // the CHOSEN access predicate's own op) and cached here, same convention as accIdx itself
         // - see that function's own comment for exactly which operators this covers and why.
         bool accIdxSkippable;
+        // True iff EVERY predicate in `sub` is kIsNull - meaning this subscription was never
+        // placed in any dimension's PS-Tree at all (accIdx/accIdxSkippable are meaningless,
+        // left at their default 0/false). See insertSubscription's own comment and
+        // nullOnlySubsByTriggerAttr_ for the side-list mechanism these subscriptions use
+        // instead.
+        bool isNullOnly = false;
     };
 
     // One leaf-group's-worth of candidate info for MatchEvent's own hot loop, inlined directly
@@ -1066,6 +1141,53 @@ private:
         for (auto& entry : allSubs) {
             DimSig sig = calculateDimSig(detail::dimSigDimensions(entry.subPtr->sub), state.dimSigLen);
             state.groups[sig].push_back(entry);
+        }
+    }
+
+    // Side-list for subscriptions whose every predicate is kIsNull (see insertSubscription's
+    // own comment) - keyed by one of the subscription's own kIsNull attributes (its
+    // predicates[0].attr, arbitrarily but deterministically - see
+    // walkNullOnlySubscriptions for why any single one is a correct trigger). NOT restricted to
+    // known schema dimensions: an attribute a real event might carry but that was never
+    // declared in this PSTDynamic's own schema is still a perfectly valid thing to test
+    // presence/absence of (predicate.hpp's matchSubscription already handles this via a raw
+    // findAttr scan, independent of any schema) - so the key here is a bare attribute name, not
+    // a dimensions_ lookup. Pointers are into subscriptions_'s own element storage, same safety
+    // argument as GroupEntry::subPtr (unordered_map never invalidates a reference/pointer to an
+    // element except by erasing that exact element, which deleteSubscription always does only
+    // after removing this bucket's own entry first).
+    std::unordered_map<std::string, std::vector<const StoredSubscription*>> nullOnlySubsByTriggerAttr_;
+    // Total count across every bucket above - tracked separately rather than summed on demand
+    // so matchEvent() can size its result vector's one reserve() call without walking every
+    // bucket per event (see matchEvent's own comment).
+    std::size_t nullOnlySubCount_ = 0;
+
+    // Full check for every null-only subscription (see insertSubscription's own comment) whose
+    // trigger attribute is absent from `event` - a linear scan over what's normally a tiny
+    // side-list, not tree indexing, since there is no tree bucket that could represent "this
+    // dimension is absent" for MatchEvent's normal per-event-attribute walk to land on.
+    //
+    // Checked against the RAW `event` parameter, not the interned/schema-indexed copy
+    // scanCandidates() builds: a null-only subscription's full verification
+    // (predicate.hpp's matchSubscription) never evaluates a VALUE for any of its predicates -
+    // only presence, via a plain findAttr scan - so string interning (which only ever rewrites
+    // VALUES) has nothing to contribute here, and reusing the raw event avoids this function
+    // needing scanCandidates' internal state at all.
+    //
+    // Keying each subscription by only ONE of its (possibly several) kIsNull attributes is
+    // still a correct trigger, not a heuristic: if that one attribute is PRESENT, the
+    // subscription can never match regardless of any other attribute's presence (a single
+    // kIsNull predicate failing fails the whole conjunction) - so skipping the bucket
+    // entirely in that case loses nothing. If it's ABSENT, the subscription might still match,
+    // and the full matchSubscription() call below re-checks every one of its predicates
+    // (including the trigger one) to confirm.
+    template <typename Visit>
+    void walkNullOnlySubscriptions(const Event& event, Visit&& visit) const {
+        for (const auto& [triggerAttr, bucket] : nullOnlySubsByTriggerAttr_) {
+            if (findAttr(event, triggerAttr) != nullptr) continue; // trigger present - can never match
+            for (const StoredSubscription* subPtr : bucket) {
+                if (matchSubscription(event, subPtr->sub)) visit(subPtr->sub.id);
+            }
         }
     }
 

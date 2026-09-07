@@ -189,10 +189,14 @@ void test_random_insert_delete_matches_brute_force() {
         if (doInsert) {
             auto sub = randomSubscription(nextId++, dims, rng);
             // A subscription whose every predicate happens to be kIsNull (possible now
-            // that randomOp can generate one) is legitimately rejected by
-            // insertSubscription - see pst_dynamic.hpp's own comment. Skip it here rather
-            // than treat it as a test failure, the same way a real caller validating its
-            // own subscriptions would.
+            // that randomOp can generate one) is no longer rejected - it's indexed via the
+            // null-only side-list instead (see pst_dynamic.hpp's insertSubscription). This
+            // try/catch still matters here (unlike test_pst_dynamic_count.cpp's all-integer
+            // schema) because `dims` includes string attributes: an ordering op
+            // (</<=/>/>=/between) landing on a string dimension is still a real,
+            // legitimately-rejected shape randomPredicate() can generate. Skip whatever
+            // genuinely gets rejected rather than treat it as a test failure, the same way a
+            // real caller validating its own subscriptions would.
             try {
                 pstd.insertSubscription(sub);
             } catch (const std::invalid_argument&) {

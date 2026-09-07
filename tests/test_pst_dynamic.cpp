@@ -400,20 +400,65 @@ void test_is_not_null_only_access_predicate() {
     require(pstd.matchEvent({{"discount", pstree::Value(std::int64_t{0})}}).empty(), "after delete, nothing should match");
 }
 
-// kIsNull cannot be an access predicate at all (see pst_dynamic.hpp's own comment on
-// selectAccPredIndex) - a subscription whose ONLY predicate is "is null" must be rejected
-// clearly at insert time, not silently accepted as unmatchable.
-void test_is_null_only_predicate_rejected() {
+// kIsNull cannot be a POSITIVE access predicate in any dimension's PS-Tree (see
+// pst_dynamic.hpp's own comment on selectAccPredIndex) - but a subscription whose ONLY
+// predicate is "is null" is still fully indexable via the null-only side-list
+// (PSTDynamic::nullOnlySubsByTriggerAttr_), not rejected. Covers insert, both matching
+// outcomes (attribute absent vs. present), and delete actually removing it.
+void test_is_null_only_predicate_indexed() {
     std::vector<pstree::AttrSchema> schema = {{"discount", pstree::ValueType::kInteger, 0}};
     pstree::PSTDynamic pstd(schema);
     pstree::Subscription sub{40, {pstree::SubPredicate{"discount", pstree::CmpOp::kIsNull, {}}}};
-    bool threw = false;
-    try {
-        pstd.insertSubscription(sub);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    require(threw, "a subscription whose only predicate is 'is null' should be rejected at insert time");
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({}).size() == 1, "discount absent entirely should match 'discount is null'");
+    require(pstd.matchEvent({{"discount", pstree::Value(std::int64_t{5})}}).empty(),
+            "discount present should not match 'discount is null'");
+    require(pstd.matchEvent({{"other", pstree::Value(std::int64_t{1})}}).size() == 1,
+            "an unrelated attribute being present shouldn't stop 'discount is null' from matching");
+
+    pstd.deleteSubscription(40);
+    require(pstd.matchEvent({}).empty(), "after delete, nothing should match");
+}
+
+// The same all-kIsNull shape, but on an attribute never declared in this PSTDynamic's own
+// schema at all - still correctly indexable, since presence/absence testing (unlike a real
+// value comparison) doesn't depend on the attribute being a known dimension (see
+// nullOnlySubsByTriggerAttr_'s own comment).
+void test_is_null_only_predicate_unknown_attribute() {
+    std::vector<pstree::AttrSchema> schema = {{"price", pstree::ValueType::kInteger, 0}};
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{41, {pstree::SubPredicate{"unscheduled_attr", pstree::CmpOp::kIsNull, {}}}};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({{"price", pstree::Value(std::int64_t{10})}}).size() == 1,
+            "unscheduled_attr absent should match, regardless of known-schema attributes present");
+    require(pstd.matchEvent({{"unscheduled_attr", pstree::Value(std::int64_t{1})}}).empty(),
+            "unscheduled_attr present should not match");
+}
+
+// Multiple kIsNull predicates in the same subscription ("X is null and Y is null") - only
+// keyed by ONE trigger attribute internally, but still requires EVERY one absent (a plain
+// conjunction), proving the single-trigger optimization doesn't silently turn this into an OR.
+void test_is_null_only_predicate_multiple_attributes() {
+    std::vector<pstree::AttrSchema> schema = {
+        {"x", pstree::ValueType::kInteger, 0},
+        {"y", pstree::ValueType::kInteger, 0},
+    };
+    pstree::PSTDynamic pstd(schema);
+    pstree::Subscription sub{42, {
+        pstree::SubPredicate{"x", pstree::CmpOp::kIsNull, {}},
+        pstree::SubPredicate{"y", pstree::CmpOp::kIsNull, {}},
+    }};
+    pstd.insertSubscription(sub);
+
+    require(pstd.matchEvent({}).size() == 1, "both x and y absent should match");
+    require(pstd.matchEvent({{"x", pstree::Value(std::int64_t{1})}}).empty(),
+            "x present (y absent) should not match - conjunction, not disjunction");
+    require(pstd.matchEvent({{"y", pstree::Value(std::int64_t{1})}}).empty(),
+            "y present (x absent) should not match - conjunction, not disjunction");
+    require(pstd.matchEvent({{"x", pstree::Value(std::int64_t{1})}, {"y", pstree::Value(std::int64_t{1})}}).empty(),
+            "both present should not match");
 }
 
 // kIsNull alongside a normal, indexable predicate: the normal predicate becomes the access
@@ -809,7 +854,9 @@ int main() {
     test_elem_of_access_predicate();
     test_ne_only_access_predicate_fallback();
     test_is_not_null_only_access_predicate();
-    test_is_null_only_predicate_rejected();
+    test_is_null_only_predicate_indexed();
+    test_is_null_only_predicate_unknown_attribute();
+    test_is_null_only_predicate_multiple_attributes();
     test_is_null_with_indexable_predicate();
     test_reorganize_groups_preserves_correctness();
     test_string_interning_no_length_limit();
